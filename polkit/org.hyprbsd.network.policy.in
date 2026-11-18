@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- SPDX-License-Identifier: BSD-2-Clause -->
+<!-- hyprbsd-network's root helper, run through pkexec; its first argument picks the action. -->
+<policyconfig>
+  <vendor>HyprBSD</vendor>
+  <vendor_url>https://hyprbsd.org/</vendor_url>
+  <action id="org.hyprbsd.network.wifi">
+    <description>Turn Wi-Fi on or off</description>
+    <message>Turning Wi-Fi on or off needs your password.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">%%PREFIX%%/libexec/hyprbsd-network-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">wifi</annotate>
+  </action>
+  <action id="org.hyprbsd.network.setup">
+    <description>Set up Wi-Fi</description>
+    <message>Setting up Wi-Fi needs your password.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">%%PREFIX%%/libexec/hyprbsd-network-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">wifi-setup</annotate>
+  </action>
+  <action id="org.hyprbsd.network.iface-switch">
+    <description>Turn a network card on or off</description>
+    <message>Turning a network card on or off needs your password.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">%%PREFIX%%/libexec/hyprbsd-network-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">iface-switch</annotate>
+  </action>
+  <action id="org.hyprbsd.network.iface">
+    <description>Change a network card's addresses</description>
+    <message>Changing a network card's addresses needs your password.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">%%PREFIX%%/libexec/hyprbsd-network-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">iface</annotate>
+  </action>
+  <action id="org.hyprbsd.network.lagg">
+    <description>Set up or remove a lagg of network cards</description>
+    <message>Setting up a lagg needs your password.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">%%PREFIX%%/libexec/hyprbsd-network-helper</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">lagg</annotate>
+  </action>
+</policyconfig>

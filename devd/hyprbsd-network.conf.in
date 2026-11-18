@@ -1,0 +1,35 @@
+# hyprbsd-network: when a Wi-Fi adapter attaches, at boot or later,
+# hyprbsd-network-helper sets up its wlan for wpa_supplicant, or gives it the
+# wlan of an adapter that isn't attached, unless another attached adapter
+# has Wi-Fi or hyprbsd_network_autosetup="NO" (logged as
+# hyprbsd-network), then the wlan starts as /etc/devd.conf's attach 0 rule
+# would start it. This rule replaces that one. When a card's link goes down
+# or the card goes away, the helper's card-gone runs in the background. When
+# an Ethernet or Wi-Fi link comes back, dhclient starts as
+# /etc/devd/dhclient.conf's rules would start it (these replace them), then
+# card-back runs in the background.
+
+attach 10 {
+	device-name "$wifi-driver-regex";
+	action "%%PREFIX%%/libexec/hyprbsd-network-helper wifi-setup -a $device-name 2>&1 | logger -t hyprbsd-network; /etc/pccard_ether $device-name startchildren";
+};
+
+notify 10 {
+	match "system"		"IFNET";
+	match "type"		"(LINK_DOWN|DETACH)";
+	action "%%PREFIX%%/libexec/hyprbsd-network-helper card-gone $subsystem 2>&1 | logger -t hyprbsd-network &";
+};
+
+notify 10 {
+	match "system"		"IFNET";
+	match "type"		"LINK_UP";
+	media-type		"ethernet";
+	action "service dhclient quietstart $subsystem; %%PREFIX%%/libexec/hyprbsd-network-helper card-back $subsystem 2>&1 | logger -t hyprbsd-network &";
+};
+
+notify 10 {
+	match "system"		"IFNET";
+	match "type"		"LINK_UP";
+	media-type		"802.11";
+	action "service dhclient quietstart $subsystem; %%PREFIX%%/libexec/hyprbsd-network-helper card-back $subsystem 2>&1 | logger -t hyprbsd-network &";
+};

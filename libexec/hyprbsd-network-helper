@@ -1,0 +1,1195 @@
+#!/bin/sh
+#
+# hyprbsd-network's root helper.
+#
+#   hyprbsd-network-helper [-r root] wifi-setup [-a] [adapter]
+#   hyprbsd-network-helper [-r root] wifi on | off | toggle
+#   hyprbsd-network-helper [-r root] iface <if> dhcp
+#   hyprbsd-network-helper [-r root] iface <if> manual <address>/<len> [<gateway> | -] [<dns>...]
+#   hyprbsd-network-helper [-r root] iface-switch <if> on | off
+#   hyprbsd-network-helper card-gone <if>
+#   hyprbsd-network-helper card-back <if>
+#   hyprbsd-network-helper [-r root] lagg <laggN> <mode> <port>,<port>... dhcp | manual ...
+#   hyprbsd-network-helper [-r root] lagg <laggN> remove
+#
+# wifi-setup: wpa_supplicant on the adapter (default: the first Wi-Fi adapter
+# FreeBSD has attached), with a control socket for wheel, a config file it
+# saves itself, kept private, and scan results kept an hour. With a root other
+# than / it only writes the files under root; on the running system (no -r, or
+# -r /) it also restarts the interface if it changed anything. -a (devd's
+# attach rule) leaves the adapter alone if another attached one has Wi-Fi or
+# rc.conf has hyprbsd_network_autosetup="NO", takes over the wlans_ line of an
+# adapter that isn't attached, and restarts nothing: a wlan already running
+# takes the settings when it next starts.
+#
+# wifi off: every wlan in rc.conf that uses wpa_supplicant gets NOAUTO, so rc
+# leaves it down at boot, and stops, its DNS servers going with it; if it had
+# the default route, or there's none, another card gets it as in card-gone.
+# wifi on takes NOAUTO out and starts it; wifi toggle is off while one is on,
+# else on. With a root other than /, only
+# rc.conf.
+#
+# iface: the card's ifconfig_ line gets DHCP or the address, keeping its other
+# words; a gateway becomes defaultrouter (one for the computer), and no gateway
+# takes this card's away; DNS servers go to resolvconf from the card's
+# /etc/start_if and /etc/stop_if, which netif runs as it starts and stops it.
+# It checks every value before writing anything. On the running system it
+# stops the card with its old settings, their DNS servers going with them, and
+# starts it with the new, unless it's off. Then, as after card-gone and wifi
+# or iface-switch off, the card the default route goes through gets its DNS
+# servers back into resolvconf if they aren't there: a DHCP card asks for its
+# lease again, a Manual card runs its /etc/start_if again.
+#
+# iface-switch: NOAUTO on the card's ifconfig_ line, so rc leaves it down at
+# boot, and stops it as wifi off stops a wlan; on takes NOAUTO out and starts
+# it.
+#
+# card-gone: run by devd when a card's link goes down or the card goes away,
+# and by /etc/dhclient-exit-hooks when its lease ends. A card that's down or
+# without a link keeps its addresses, but one on another linked card's
+# network drops to /32 (a Manual card's, if it's rc.conf's) until dhclient or
+# card-back sets it again. If the card had the default route, or there's
+# none, its DNS servers from DHCP go and the route goes to the first other
+# card, up with a link, that takes it. With no card to take it, a Manual card
+# keeps the route. A card without a link loses its Manual DNS servers unless
+# the route still goes through it. The route's card gets its DNS servers.
+#
+# card-back: run by devd when a card's link comes back. A Manual card that's
+# up with a link when it runs gets its rc.conf address back from /32; with no
+# default route, the card gets defaultrouter if that's on its network; its DNS
+# servers go back in from the /etc/start_if iface wrote. The route's card gets
+# its DNS servers. A DHCP card is left to dhclient.
+#
+# lagg: lagg laggN, made or changed, in failover, lacp, loadbalance or
+# roundrobin mode with the ports in that order, addressed as iface addresses a
+# card; it's in cloned_interfaces, its ifconfig_ line `up laggproto <mode>
+# laggport <port>...` with the address and the mtu and accept_rtadv it had,
+# each port's line `up`, a wlan's `WPA`, and with a wlan among them, a wired
+# port's `ether <the wlan's MAC address>`;
+# a port's own gateway and DNS hooks go. A port it no longer has goes back to
+# DHCP. remove takes the lagg out of rc.conf, with its gateway and DNS hooks,
+# its ports back to DHCP. It checks everything first, and leaves a lagg or port
+# set up by hand as it is. On the running system it stops the lagg, restarts
+# the ports and starts the lagg; remove destroys it, and a wired port gets its
+# own MAC address back.
+#
+# On the running system the helper runs one command at a time.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+set -eu
+# No pathname expansion: words split from rc.conf stay as written.
+set -f
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+umask 077
+
+prog=hyprbsd-network-helper
+CTRL_DIR=/var/run/wpa_supplicant
+CTRL_GROUP=wheel
+LOCK=/var/run/hyprbsd-network.lock
+# How long wpa_supplicant keeps a network it no longer sees in a scan, in
+# seconds.
+BSS_AGE=3600
+
+die() {
+	echo "$prog: $*" >&2
+	exit 1
+}
+
+usage() {
+	echo "usage: $prog [-r root] wifi-setup [-a] [adapter]" >&2
+	echo "       $prog [-r root] wifi on | off | toggle" >&2
+	echo "       $prog [-r root] iface <if> dhcp" >&2
+	echo "       $prog [-r root] iface <if> manual <address>/<len> [<gateway> | -] [<dns>...]" >&2
+	echo "       $prog [-r root] iface-switch <if> on | off" >&2
+	echo "       $prog card-gone <if>" >&2
+	echo "       $prog card-back <if>" >&2
+	echo "       $prog [-r root] lagg <laggN> failover|lacp|loadbalance|roundrobin <port>,<port>... dhcp | manual ..." >&2
+	echo "       $prog [-r root] lagg <laggN> remove" >&2
+	exit 2
+}
+
+root=/
+while getopts r: opt; do
+	case $opt in
+	r) root=$OPTARG ;;
+	*) usage ;;
+	esac
+done
+shift $((OPTIND - 1))
+[ $# -ge 1 ] || usage
+[ -d "$root/etc" ] || die "$root has no etc directory."
+root=$(cd "$root" && pwd)
+# The prefix for files: empty on the running system.
+if [ "$root" = / ]; then R=; else R=$root; fi
+[ -n "$R" ] || [ "$(id -u)" -eq 0 ] || die "run this as root."
+if [ -z "$R" ] && [ -z "${HYPRBSD_NETWORK_LOCKED:-}" ]; then
+	HYPRBSD_NETWORK_LOCKED=1
+	export HYPRBSD_NETWORK_LOCKED
+	exec lockf -k "$LOCK" "$0" "$@"
+fi
+
+# sysrc on the running system's rc.conf files, or on root's rc.conf.
+rc() {
+	if [ -z "$R" ]; then
+		sysrc "$@"
+	else
+		sysrc -f "$R/etc/rc.conf" "$@"
+	fi
+}
+
+rc_get() {
+	rc -n "$1" 2>/dev/null || true
+}
+
+changed=no
+
+# Sets rc.conf's $1 to $2 unless it already is.
+rc_set() {
+	[ "$(rc_get "$1")" != "$2" ] || return 0
+	rc "$1=$2" >/dev/null || die "couldn't set $1 in rc.conf."
+	changed=yes
+}
+
+# The Wi-Fi adapters FreeBSD has attached; HYPRBSD_NETWORK_WLAN_DEVICES
+# stands in for them in tests.
+adapters() {
+	if [ "${HYPRBSD_NETWORK_WLAN_DEVICES+set}" = set ]; then
+		echo "$HYPRBSD_NETWORK_WLAN_DEVICES"
+	else
+		sysctl -n net.wlan.devices 2>/dev/null || true
+	fi
+}
+
+# Whether ifconfig_ value $1 has a word of its own matching $2 (an extended
+# regular expression), in any case, as rc's wpaif and dhcpif look for WPA and
+# DHCP (network.subr).
+has_word() {
+	printf '%s\n' "$1" | tr -s ' \t' '\n\n' | grep -qixE "$2"
+}
+
+# ifconfig_ value $1 without its NOAUTO, in any case.
+without_noauto() {
+	printf '%s\n' "$1" | tr -s ' \t' '\n\n' | grep -vix noauto | paste -s -d ' ' -
+}
+
+# The wlans_ lines in rc.conf that name a wlan, as "wlans_<adapter>: <wlans>".
+wlans_lines() {
+	rc -a 2>/dev/null | grep '^wlans_[^:]*: *[^[:space:]]' || true
+}
+
+# The first wlanN that no wlans_ line in rc.conf names.
+free_wlan() {
+	_taken=$(wlans_lines | sed 's/^[^:]*: //')
+	_n=0
+	while :; do
+		case " $(echo $_taken) " in
+		*" wlan$_n "*) _n=$((_n + 1)) ;;
+		*) break ;;
+		esac
+	done
+	echo "wlan$_n"
+}
+
+# Writes the wpa_supplicant config file $1 with the control socket, saving and
+# the scan results' age set, keeping its networks and other settings, through a
+# new file renamed over the old.
+write_conf() {
+	_conf=$1
+	_new=$(mktemp "$_conf.XXXXXX" 2>/dev/null) || die "couldn't write a new file in $(dirname "$_conf")."
+	# Outside network={...} and other blocks, the file's first ctrl_interface,
+	# update_config and bss_expiration_age lines become ours where they are,
+	# the rest of them and ctrl_interface_group lines go, and ours that were
+	# missing come first.
+	_old=$_conf
+	[ -f "$_old" ] || _old=/dev/null
+	awk -v ctrl="ctrl_interface=DIR=$CTRL_DIR GROUP=$CTRL_GROUP" -v age="bss_expiration_age=$BSS_AGE" '
+		# The line as wpa_supplicant reads it: a # outside quotes ends
+		# it, then blanks are trimmed.
+		function bare(s,   i, c, q, out) {
+			q = 0
+			out = ""
+			for (i = 1; i <= length(s); i++) {
+				c = substr(s, i, 1)
+				if (c == "\"")
+					q = !q
+				else if (c == "#" && !q)
+					break
+				out = out c
+			}
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", out)
+			return out
+		}
+		BEGIN {
+			ours["ctrl_interface"] = ctrl
+			ours["update_config"] = "update_config=1"
+			ours["bss_expiration_age"] = age
+			keys = split("ctrl_interface update_config bss_expiration_age", order, " ")
+		}
+		{ l = bare($0) }
+		depth == 0 && l ~ /^(ctrl_interface|ctrl_interface_group|update_config|bss_expiration_age)[[:space:]]*=/ {
+			key = l
+			sub(/[[:space:]]*=.*/, "", key)
+			if ((key in ours) && !(key in seen)) {
+				seen[key] = 1
+				lines[++n] = ours[key]
+			}
+			next
+		}
+		l ~ /^(network|cred|blob-base64-[^=]+)=\{$/ { depth++ }
+		l == "}" && depth > 0 { depth-- }
+		{ lines[++n] = $0 }
+		END {
+			for (i = 1; i <= keys; i++)
+				if (!(order[i] in seen))
+					print ours[order[i]]
+			for (i = 1; i <= n; i++)
+				print lines[i]
+		}' "$_old" >"$_new" || { rm -f "$_new"; die "couldn't write a new copy of $_conf."; }
+	if [ -f "$_conf" ] && cmp -s "$_new" "$_conf"; then
+		rm -f "$_new"
+		[ "$(stat -f %Lp "$_conf")" != 600 ] || return 0
+		chmod 0600 "$_conf" || die "couldn't make $_conf private."
+	else
+		mv -f "$_new" "$_conf" || { rm -f "$_new"; die "couldn't replace $_conf."; }
+	fi
+	changed=yes
+}
+
+# wifi_setup auto [adapter]
+wifi_setup() {
+	dev=${2:-$(adapters | awk '{ print $1 }')}
+	if [ -z "$dev" ]; then
+		echo "No Wi-Fi adapter that FreeBSD can use; nothing to set up."
+		return 0
+	fi
+	case $dev in
+	*[!a-z0-9]* | [!a-z]* | *[!0-9]) die "\"$dev\" isn't a valid adapter name." ;;
+	esac
+	wlans=$(rc_get "wlans_$dev")
+	gone=
+	if [ "$1" = yes ]; then
+		case $(rc_get hyprbsd_network_autosetup) in
+		[Nn][Oo])
+			echo "hyprbsd_network_autosetup is NO; $dev left as it is."
+			return 0
+			;;
+		esac
+		if [ -z "$wlans" ] && [ -n "$(wlans_lines)" ]; then
+			for other in $(wlans_lines | sed 's/^wlans_\([^:]*\):.*/\1/'); do
+				if has_word "$(adapters)" "$other"; then
+					echo "Wi-Fi is set up on another adapter; $dev left as it is."
+					return 0
+				fi
+				[ -n "$gone" ] || gone=$other
+			done
+			wlans=$(rc_get "wlans_$gone")
+		fi
+	fi
+	wlan=${wlans%% *}
+	[ -n "$wlan" ] || wlan=$(free_wlan)
+	ifc=$(rc_get "ifconfig_$wlan")
+	if [ -z "$ifc" ]; then
+		ifc="WPA DHCP"
+	elif ! has_word "$ifc" wpa; then
+		die "ifconfig_$wlan is \"$ifc\", which doesn't use wpa_supplicant (no WPA); left as it is."
+	fi
+
+	conf=$(rc_get wpa_supplicant_conf_file)
+	write_conf "$R${conf:-/etc/wpa_supplicant.conf}"
+	if [ -n "$gone" ]; then
+		rc -x "wlans_$gone" || die "couldn't take wlans_$gone out of rc.conf."
+		rc_set "wlans_$dev" "$wlans"
+		echo "Moved Wi-Fi ($wlans) from $gone, which isn't attached, to $dev."
+	fi
+	[ -n "$wlans" ] || rc_set "wlans_$dev" "$wlan"
+	rc_set "ifconfig_$wlan" "$ifc"
+	# wpa_supplicant writes its saved file with its own umask.
+	rc_set wpa_supplicant_umask 077
+
+	if [ "$changed" = no ]; then
+		echo "Wi-Fi on $dev ($wlan) is already set up."
+		return 0
+	fi
+	echo "Set up Wi-Fi on $dev as $wlan."
+	[ -z "$R" ] || return 0
+	if [ "$1" = yes ]; then
+		# A wlan that exists keeps running as it is; devd's rule starts one
+		# that doesn't (pccard_ether).
+		if ifconfig "$wlan" >/dev/null 2>&1; then
+			echo "$wlan takes the new settings when it next starts."
+		fi
+		return 0
+	fi
+	service netif restart "$wlan" >/dev/null || die "couldn't start $wlan (service netif restart $wlan)."
+}
+
+# wifi_switch on|off|toggle; toggle is off while a wlan using wpa_supplicant
+# is on, and on when every one is off.
+wifi_switch() {
+	if [ "$1" = toggle ]; then
+		set -- on
+		for wlan in $(wlans_lines | sed 's/^[^:]*: //'); do
+			ifc=$(rc_get "ifconfig_$wlan")
+			has_word "$ifc" wpa && ! has_word "$ifc" noauto || continue
+			set -- off
+			break
+		done
+	fi
+	found=no
+	for wlan in $(wlans_lines | sed 's/^[^:]*: //'); do
+		ifc=$(rc_get "ifconfig_$wlan")
+		has_word "$ifc" wpa || continue
+		found=yes
+		rest=$(without_noauto "$ifc")
+		if [ "$1" = off ]; then
+			rc_set "ifconfig_$wlan" "$rest NOAUTO"
+			[ -z "$R" ] && ifconfig "$wlan" >/dev/null 2>&1 || continue
+			stop_card "$wlan"
+		else
+			rc_set "ifconfig_$wlan" "$rest"
+			# Starts the wlan unless wpa_supplicant runs on it (its socket is there).
+			[ -n "$R" ] || [ -S "$CTRL_DIR/$wlan" ] ||
+				service netif restart "$wlan" >/dev/null || die "couldn't start $wlan (service netif restart $wlan)."
+		fi
+	done
+	[ "$found" = yes ] || die "Wi-Fi isn't set up (hyprbsd-network-helper wifi-setup sets it up)."
+	echo "Wi-Fi is $1."
+}
+
+# Dotted IPv4 address $1 as a number: four decimal octets, no leading zeros.
+ip_num() {
+	case $1 in
+	*[!0-9.]* | .* | *. | *..*) return 1 ;;
+	esac
+	_ifs=$IFS
+	IFS=.
+	set -- $1
+	IFS=$_ifs
+	[ $# -eq 4 ] || return 1
+	_n=0
+	for _o; do
+		case $_o in
+		[0-9] | [1-9][0-9] | [1-9][0-9][0-9]) [ "$_o" -le 255 ] || return 1 ;;
+		*) return 1 ;;
+		esac
+		_n=$((_n * 256 + _o))
+	done
+	echo "$_n"
+}
+
+# The netmask of prefix length $1, as a number.
+prefix_mask() {
+	echo $(((0xffffffff << (32 - $1)) & 0xffffffff))
+}
+
+# The prefix length of netmask $1 (dotted or 0x hex), if its bits are contiguous.
+mask_len() {
+	case $1 in
+	0x[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) _m=$(($1)) ;;
+	*) _m=$(ip_num "$1") || return 1 ;;
+	esac
+	_l=0
+	while [ $_l -lt 32 ] && [ $((_m & (0x80000000 >> _l))) -ne 0 ]; do
+		_l=$((_l + 1))
+	done
+	[ "$_l" -gt 0 ] && [ "$_m" -eq "$(prefix_mask "$_l")" ] || return 1
+	echo "$_l"
+}
+
+# Whether address number $1 can be a host's: not 0.x, 127.x or multicast and above.
+host_num() {
+	[ $(($1 >> 24)) -ne 0 ] && [ $(($1 >> 24)) -ne 127 ] && [ $(($1 >> 24)) -lt 224 ]
+}
+
+# "network" or "broadcast" if address number $1 is that address of its
+# network with prefix length $2.
+edge_name() {
+	[ "$2" -le 30 ] || return 1
+	_mask=$(prefix_mask "$2")
+	if [ "$1" -eq $(($1 & _mask)) ]; then
+		echo network
+	elif [ "$1" -eq $((($1 & _mask) | (~_mask & 0xffffffff))) ]; then
+		echo broadcast
+	else
+		return 1
+	fi
+}
+
+# Whether address $1 is on the network of address $2 with prefix length $3.
+on_network() {
+	_a=$(ip_num "$1") && _b=$(ip_num "$2") || return 1
+	case $3 in [1-9] | [12][0-9] | 3[0-2]) ;; *) return 1 ;; esac
+	_mask=$(prefix_mask "$3")
+	[ $((_a & _mask)) -eq $((_b & _mask)) ]
+}
+
+# Whether address $1 is on the network of the card's address in rc.conf
+# (cur_addr and cur_len, from split_value).
+on_card_network() {
+	[ -n "$cur_addr" ] && [ -n "$cur_len" ] && on_network "$1" "$cur_addr" "$cur_len"
+}
+
+# Checks the card's new address $1 (a.b.c.d/len); sets addr and len.
+check_address() {
+	case $1 in
+	*/*) ;;
+	*) die "\"$1\" needs a prefix length, like 192.168.1.5/24." ;;
+	esac
+	addr=${1%/*}
+	len=${1#*/}
+	_a=$(ip_num "$addr") || die "\"$addr\" isn't an IPv4 address (four numbers 0-255, like 192.168.1.5)."
+	case $len in
+	[1-9] | [12][0-9] | 3[0-2]) ;;
+	*) die "the prefix length must be 1 to 32, not \"$len\"." ;;
+	esac
+	host_num "$_a" || die "$addr can't be a computer's address."
+	! _e=$(edge_name "$_a" "$len") || die "$addr is the $_e address of its /$len network."
+}
+
+# Checks gateway $1 for the new address.
+check_gateway() {
+	_g=$(ip_num "$1") || die "\"$1\" isn't an IPv4 address (four numbers 0-255, like 192.168.1.1)."
+	host_num "$_g" || die "$1 can't be a gateway."
+	[ "$len" -le 31 ] || die "a /32 address has no gateway on its network."
+	on_network "$1" "$addr" "$len" || die "the gateway $1 isn't on $addr/$len's network."
+	[ "$1" != "$addr" ] || die "the gateway can't be the card's own address."
+	! _e=$(edge_name "$_g" "$len") || die "$1 is the $_e address of $addr/$len's network."
+}
+
+# Checks DNS server $1.
+check_dns() {
+	_d=$(ip_num "$1") || die "\"$1\" isn't an IPv4 address for a DNS server."
+	[ $((_d >> 24)) -ne 0 ] && [ $((_d >> 24)) -lt 224 ] || die "$1 can't be a DNS server."
+}
+
+# Checks interface name $1 (a letter, then letters, digits, _ . or -; 15 at most).
+check_ifname() {
+	case $1 in
+	'' | *[!A-Za-z0-9_.-]* | [!A-Za-z]*) die "\"$1\" isn't an interface name." ;;
+	lo[0-9]*) die "$1 is the loopback interface." ;;
+	esac
+	[ ${#1} -le 15 ] || die "\"$1\" isn't an interface name."
+}
+
+# On the running system: card $1 exists, isn't cloned (a bridge, tap, lagg...),
+# except a wlan, and isn't part of a bridge or lagg, but for lagg $2's port.
+check_card() {
+	[ -z "$R" ] || return 0
+	ifconfig -n "$1" >/dev/null 2>&1 || die "there's no interface $1."
+	_cloners=$(ifconfig -C)
+	for _g in $(ifconfig "$1" | sed -n 's/^[[:space:]]*groups: //p'); do
+		[ "$_g" != wlan ] || continue
+		case " $_cloners " in
+		*" $_g "*) die "$1 is a $_g interface, set up in rc.conf; left as it is." ;;
+		esac
+	done
+	_in=$(member_of "$1")
+	[ -z "$_in" ] || [ "$_in" = "${2:-}" ] || die "$1 is part of $_in, set up in rc.conf; left as it is."
+}
+
+# The bridge or lagg interface $1 is a member or port of, if any.
+member_of() {
+	ifconfig -a | awk -v card="$1" '
+		/^[^[:space:]]/ { name = $1; sub(/:$/, "", name) }
+		($1 == "member:" || $1 == "laggport:") && $2 == card { print name; exit }'
+}
+
+# Whether interface $1 is a bridge's member or a lagg's port.
+in_bridge_or_lagg() {
+	[ -n "$(member_of "$1")" ]
+}
+
+# The rc.conf name for setting ifconfig_$1, as rc's get_if_var makes it.
+ifconfig_var() {
+	echo "ifconfig_$(printf '%s' "$1" | tr './+-' '____')"
+}
+
+# The card's ifconfig_ value: its own line, or else ifconfig_DEFAULT.
+card_value() {
+	rc -n "$(ifconfig_var "$1")" 2>/dev/null || rc_get ifconfig_DEFAULT
+}
+
+# Splits ifconfig_ value $1 into what iface sets and the rest: dhcp (DHCP,
+# SYNCDHCP or NOSYNCDHCP as written), wpa, noauto, cur_addr and cur_len (its
+# address: after inet, or a word that looks like one, which ifconfig takes as
+# the address since it isn't a command) and rest (up, mtu <n>, accept_rtadv,
+# laggproto <proto>, laggport <port>). Fails on any other word, and on a
+# second address.
+split_value() {
+	dhcp= wpa= noauto= cur_addr= cur_len= rest=
+	set -- $1
+	while [ $# -gt 0 ]; do
+		_w=$1
+		shift
+		case $_w in
+		[Dd][Hh][Cc][Pp] | [Ss][Yy][Nn][Cc][Dd][Hh][Cc][Pp] | [Nn][Oo][Ss][Yy][Nn][Cc][Dd][Hh][Cc][Pp])
+			dhcp=$_w
+			continue
+			;;
+		[Ww][Pp][Aa])
+			wpa=$_w
+			continue
+			;;
+		[Nn][Oo][Aa][Uu][Tt][Oo])
+			noauto=$_w
+			continue
+			;;
+		up | accept_rtadv | -accept_rtadv)
+			rest="$rest $_w"
+			continue
+			;;
+		laggproto | laggport)
+			[ $# -ge 1 ] || return 1
+			rest="$rest $_w $1"
+			shift
+			continue
+			;;
+		mtu)
+			case ${1:-} in
+			'' | *[!0-9]*) return 1 ;;
+			esac
+			rest="$rest mtu $1"
+			shift
+			continue
+			;;
+		inet)
+			[ $# -ge 1 ] || return 1
+			_w=$1
+			shift
+			;;
+		[0-9]*.*) ;;
+		*) return 1 ;;
+		esac
+		[ -z "$cur_addr" ] || return 1
+		cur_addr=${_w%/*}
+		case $_w in
+		*/*) cur_len=${_w#*/} ;;
+		esac
+		ip_num "$cur_addr" >/dev/null || return 1
+		while [ $# -ge 2 ]; do
+			case $1 in
+			netmask) cur_len=$(mask_len "$2") || return 1 ;;
+			broadcast) ;;
+			*) break ;;
+			esac
+			shift 2
+		done
+	done
+}
+
+# Whether resolvconf, as /etc/resolvconf.conf sets it, hands DNS servers on.
+resolvconf_on() {
+	_conf=$R/etc/resolvconf.conf
+	[ -f "$_conf" ] || return 0
+	case $(
+		set +eu
+		. "$_conf" >/dev/null 2>&1
+		echo "${resolvconf:-YES}"
+	) in
+	[Yy][Ee][Ss] | [Tt][Rr][Uu][Ee] | [Oo][Nn] | 1) return 0 ;;
+	esac
+	return 1
+}
+
+# The words $@ joined by single spaces.
+words() {
+	echo $*
+}
+
+# Whether interface $1 is a wlan (wlanN, or named in a wlans_ line).
+is_wlan() {
+	case $1 in
+	wlan[0-9]*) return 0 ;;
+	esac
+	wlans_lines | sed 's/^[^:]*: //' | tr ' ' '\n' | grep -qxF "$1"
+}
+
+# The interface the default route goes through, if there's one.
+default_if() {
+	route -n get default 2>/dev/null | sed -n 's/^[[:space:]]*interface: //p'
+}
+
+# Whether the default route goes through interface $1.
+default_through() {
+	[ "$(default_if)" = "$1" ]
+}
+
+# Deletes the default route, every path of it.
+delete_default() {
+	_i=0
+	while [ $_i -lt 4 ] && route -n get default >/dev/null 2>&1; do
+		route -n delete default >/dev/null 2>&1 || break
+		_i=$((_i + 1))
+	done
+}
+
+# Takes card $1's DNS servers out of resolv.conf, DHCP's and Manual ones.
+dns_out() {
+	resolvconf -f -d "$1" >/dev/null 2>&1 || true
+	resolvconf -f -d "$1:static" >/dev/null 2>&1 || true
+}
+
+# Starts dhclient on card $1 unless it's running there.
+start_dhcp() {
+	service dhclient quietstart "$1" >/dev/null 2>&1 || true
+}
+
+# The first line of the hooks iface writes for card $1.
+hook_mark() {
+	echo "# hyprbsd-network: $1's DNS servers, through resolvconf(8)."
+}
+
+# Whether hook $1 is missing or one iface wrote for card $2.
+hook_ours() {
+	[ ! -e "$1" ] || [ "$(head -n 1 "$1")" = "$(hook_mark "$2")" ]
+}
+
+# Writes file $1 with standard input, readable by everyone, through a new file
+# renamed over it.
+write_public() {
+	_new=$(mktemp "$1.XXXXXX" 2>/dev/null) || die "couldn't write a new file in $(dirname "$1")."
+	cat >"$_new" && chmod 0644 "$_new" && mv -f "$_new" "$1" || { rm -f "$_new"; die "couldn't write $1."; }
+}
+
+# iface <if> dhcp | manual <address>/<len> [<gateway> | -] [<dns>...]
+iface() {
+	iface_args "$@"
+	check_card "$card"
+	check_hooks
+	set_address
+}
+
+# Checks iface's arguments, <if> dhcp | manual ...; sets card, mode, gw and
+# dns, and for manual addr and len.
+iface_args() {
+	[ $# -ge 2 ] || usage
+	card=$1
+	mode=$2
+	shift 2
+	check_ifname "$card"
+	gw=
+	dns=
+	case $mode in
+	dhcp) [ $# -eq 0 ] || usage ;;
+	manual)
+		[ $# -ge 1 ] || usage
+		check_address "$1"
+		shift
+		if [ $# -ge 1 ]; then
+			[ "$1" = - ] || { check_gateway "$1" && gw=$1; }
+			shift
+		fi
+		[ $# -le 3 ] || die "at most three DNS servers (the resolver uses three)."
+		for _s; do
+			check_dns "$_s"
+		done
+		dns=$*
+		;;
+	*) usage ;;
+	esac
+}
+
+# Checks that card's DNS servers have somewhere to go: hooks iface wrote, or
+# none, and resolvconf on.
+check_hooks() {
+	start_hook=$R/etc/start_if.$card
+	stop_hook=$R/etc/stop_if.$card
+	for _h in "$start_hook" "$stop_hook"; do
+		hook_ours "$_h" "$card" && continue
+		[ -z "$dns" ] || die "$_h isn't hyprbsd-network's, and the DNS servers would go there; left as it is."
+	done
+	[ -z "$dns" ] || resolvconf_on ||
+		die "resolvconf is off in /etc/resolvconf.conf, so nothing would take the DNS servers; left as it is."
+}
+
+# Gives card the address iface_args read, in rc.conf and, on the running
+# system, by restarting it.
+set_address() {
+	var=$(ifconfig_var "$card")
+	split_value "$(card_value "$card")" ||
+		die "$var is \"$(card_value "$card")\", which has more than this changes (DHCP, one IPv4 address, up, mtu, accept_rtadv, a lagg's laggproto and laggports); left as it is."
+
+	# The gateway is this card's if it's on the card's network, old or new.
+	router=$(rc_get defaultrouter)
+	ours=no
+	case $router in
+	'' | [Nn][Oo]) router= ;;
+	*)
+		if on_card_network "$router" || { [ "$mode" = manual ] && on_network "$router" "$addr" "$len"; }; then
+			ours=yes
+		fi
+		;;
+	esac
+
+	if [ "$mode" = dhcp ]; then
+		value=$(words $wpa "${dhcp:-DHCP}" $rest $noauto)
+		dhcp=${dhcp:-DHCP}
+	else
+		value=$(words $wpa inet "$addr/$len" $rest $noauto)
+		dhcp=
+	fi
+
+	was_default=no
+	if [ -z "$R" ]; then
+		! default_through "$card" || was_default=yes
+		service netif stop "$card" >/dev/null 2>&1 || true
+		dns_out "$card"
+	fi
+
+	rc_set "$var" "$value"
+	if [ -n "$gw" ]; then
+		rc_set defaultrouter "$gw"
+	elif [ "$ours" = yes ]; then
+		rc -x defaultrouter >/dev/null || die "couldn't take defaultrouter out of rc.conf."
+	fi
+	if [ -n "$dns" ]; then
+		{
+			hook_mark "$card"
+			echo "printf 'nameserver %s\\n' $dns | /sbin/resolvconf -a $card:static"
+		} | write_public "$start_hook"
+		{
+			hook_mark "$card"
+			echo "/sbin/resolvconf -f -d $card:static"
+		} | write_public "$stop_hook"
+	else
+		for _h in "$start_hook" "$stop_hook"; do
+			! { [ -e "$_h" ] && hook_ours "$_h" "$card"; } || rm -f "$_h" || die "couldn't remove $_h."
+		done
+	fi
+
+	if [ "$mode" = dhcp ]; then
+		echo "$card gets its address by DHCP."
+	else
+		echo "$card has the address $addr/$len${gw:+, gateway $gw}${dns:+, DNS $dns}."
+	fi
+	# Nothing to start on a scratch root, or for a card that's off.
+	[ -z "$R" ] && [ -z "$noauto" ] || return 0
+
+	# A default route through the card goes with its old settings.
+	[ "$was_default" = no ] || [ -n "$gw" ] || delete_default
+	service netif start "$card" >/dev/null || die "couldn't start $card (service netif start $card)."
+	[ -z "$dhcp" ] || start_dhcp "$card"
+	if [ -n "$gw" ]; then
+		delete_default
+		route -n add default "$gw" >/dev/null || die "couldn't add the default route through $gw."
+	fi
+	route_dns
+}
+
+# Interface $1's IPv4 addresses, one "<address> <prefix length>" line each.
+inet_lines() {
+	ifconfig "$1" 2>/dev/null | sed -n 's/^[[:space:]]*inet \([0-9.]*\) netmask \(0x[0-9a-fA-F]*\).*/\1 \2/p' |
+		while read -r _a _m; do
+			if _l=$(mask_len "$_m"); then
+				echo "$_a $_l"
+			fi
+		done
+}
+
+# Whether address $2 is on the network of one of interface $1's addresses.
+on_if_network() {
+	inet_lines "$1" | {
+		while read -r _a _l; do
+			! on_network "$2" "$_a" "$_l" || exit 0
+		done
+		exit 1
+	}
+}
+
+# Whether interface $1 is up.
+is_up() {
+	ifconfig -n "$1" 2>/dev/null | head -n 1 | grep -q '<UP[,>]'
+}
+
+# Whether card $1 gets its address by DHCP, as rc.conf has it.
+dhcp_card() {
+	has_word "$(card_value "$1")" 'dhcp|syncdhcp|nosyncdhcp'
+}
+
+# Whether interface $1 has a link: a cable in, or a Wi-Fi network joined.
+has_link() {
+	ifconfig "$1" 2>/dev/null | grep -qE '^[[:space:]]*status: (active|associated)$'
+}
+
+# Gives the default route to the first card other than $1, up with a link and
+# not part of a bridge or lagg, that takes it: a DHCP card asks for its lease
+# again, so dhclient-script adds its router and DNS servers; a Manual card on
+# defaultrouter's network gets defaultrouter. A route that ends up through
+# another card is deleted. Fails if none takes it.
+route_elsewhere() {
+	_router=$(rc_get defaultrouter)
+	for _c in $(ifconfig -l); do
+		[ "$_c" != "$1" ] && is_up "$_c" && has_link "$_c" && ! in_bridge_or_lagg "$_c" || continue
+		if dhcp_card "$_c"; then
+			service dhclient restart "$_c" >/dev/null 2>&1 || true
+			_took="The default route goes to $_c, by DHCP."
+		elif on_if_network "$_c" "$_router"; then
+			route -n add default "$_router" >/dev/null 2>&1 || true
+			_took="The default route goes to $_router, through $_c."
+		else
+			continue
+		fi
+		if default_through "$_c"; then
+			echo "$_took"
+			return 0
+		fi
+		echo "$_c didn't take the default route."
+		delete_default
+	done
+	echo "No other card took the default route."
+	return 1
+}
+
+# Sets cur_addr and cur_len to Manual card $1's address and prefix length in
+# rc.conf; fails for a DHCP card or a line without both.
+manual_address() {
+	! dhcp_card "$1" && split_value "$(card_value "$1")" && [ -n "$cur_addr" ] && [ -n "$cur_len" ]
+}
+
+# Shrinks to /32 each address of card $1 on the network of another card with
+# a link, so that network goes through the other card: any of a DHCP card's,
+# whose next lease sets the netmask again, or a Manual card's rc.conf address,
+# which card-back sets again.
+shrink_shared() {
+	_own=
+	if ! dhcp_card "$1"; then
+		manual_address "$1" || return 0
+		_own=$cur_addr
+	fi
+	inet_lines "$1" | while read -r _a _l; do
+		[ "$_l" -lt 32 ] && { [ -z "$_own" ] || [ "$_a" = "$_own" ]; } || continue
+		for _c in $(ifconfig -l); do
+			[ "$_c" != "$1" ] && has_link "$_c" && on_if_network "$_c" "$_a" || continue
+			echo "$1's $_a is /32 while $_c is on its network."
+			ifconfig "$1" inet "$_a/32" >/dev/null 2>&1 || true
+			break
+		done
+	done
+}
+
+# Puts Manual card $1's DNS servers back into resolvconf when they aren't
+# there, by running the /etc/start_if iface wrote for it.
+static_dns_back() {
+	_h=$R/etc/start_if.$1
+	[ -e "$_h" ] && hook_ours "$_h" "$1" || return 0
+	! resolvconf -i "$1:static" >/dev/null 2>&1 || return 0
+	echo "$1's DNS servers go back into resolvconf."
+	sh "$_h" >/dev/null 2>&1 || true
+}
+
+# Puts the DNS servers of the card the default route goes through into
+# resolvconf when they aren't there: a DHCP card asks for its lease again, so
+# dhclient-script hands them over; a Manual card runs its /etc/start_if again.
+route_dns() {
+	_r=$(default_if)
+	[ -n "$_r" ] || return 0
+	if dhcp_card "$_r"; then
+		! resolvconf -i "$_r" >/dev/null 2>&1 || return 0
+		echo "$_r has the default route but no DNS servers: asking DHCP again."
+		service dhclient restart "$_r" >/dev/null 2>&1 || true
+		return 0
+	fi
+	static_dns_back "$_r"
+}
+
+# Stops card $1, its DNS servers going with it; if it had the default route,
+# or there's none, another card with a link gets the route. The route's card
+# gets its DNS servers.
+stop_card() {
+	_had=no
+	! default_through "$1" || _had=yes
+	service netif stop "$1" >/dev/null || die "couldn't stop $1 (service netif stop $1)."
+	dns_out "$1"
+	[ "$_had" = no ] || delete_default
+	route -n get default >/dev/null 2>&1 || route_elsewhere "$1" || true
+	route_dns
+}
+
+# card-gone <if>
+card_gone() {
+	[ $# -eq 1 ] || usage
+	card=$1
+	check_ifname "$card"
+	[ -z "$R" ] || die "card-gone acts on the running system only."
+	gone=no
+	back=
+	if ! is_up "$card" || ! has_link "$card"; then
+		gone=yes
+		router=$(rc_get defaultrouter)
+		if default_through "$card" && ! dhcp_card "$card" && on_if_network "$card" "$router"; then
+			back=$router
+		fi
+		shrink_shared "$card"
+		! default_through "$card" || delete_default
+	fi
+	if ! route -n get default >/dev/null 2>&1; then
+		resolvconf -f -d "$card" >/dev/null 2>&1 || true
+		if ! route_elsewhere "$card" && [ -n "$back" ]; then
+			echo "The default route stays through $card."
+			route -n add default "$back" >/dev/null 2>&1 || true
+		fi
+	fi
+	if [ "$gone" = yes ] && ! default_through "$card"; then
+		resolvconf -f -d "$card:static" >/dev/null 2>&1 || true
+	fi
+	route_dns
+}
+
+# card-back <if>
+card_back() {
+	[ $# -eq 1 ] || usage
+	card=$1
+	check_ifname "$card"
+	[ -z "$R" ] || die "card-back acts on the running system only."
+	! dhcp_card "$card" && is_up "$card" && has_link "$card" || return 0
+	if manual_address "$card" && [ "$cur_len" -lt 32 ] && inet_lines "$card" | grep -qxF "$cur_addr 32"; then
+		echo "$card's $cur_addr is /$cur_len again."
+		ifconfig "$card" inet "$cur_addr/$cur_len" >/dev/null 2>&1 || true
+	fi
+	router_if_none "$card" || true
+	static_dns_back "$card"
+	route_dns
+}
+
+# With no default route, gives card $1 defaultrouter if that's on its network;
+# fails if route can't add it.
+router_if_none() {
+	router=$(rc_get defaultrouter)
+	! route -n get default >/dev/null 2>&1 && on_if_network "$1" "$router" || return 0
+	echo "The default route goes to $router, through $1."
+	route -n add default "$router" >/dev/null
+}
+
+# The words in rest (from split_value) but up, laggproto and laggport.
+lagg_others() {
+	set -- $rest
+	while [ $# -gt 0 ]; do
+		case $1 in
+		up) ;;
+		laggproto | laggport) shift ;;
+		*) echo "$1" ;;
+		esac
+		shift
+	done
+}
+
+# The laggport words' ports in ifconfig_ value $1.
+lagg_ports() {
+	set -- $1
+	while [ $# -ge 2 ]; do
+		[ "$1" != laggport ] || echo "$2"
+		shift
+	done
+}
+
+# Takes Manual card $1's gateway, if defaultrouter is on its network, and the
+# DNS hooks iface wrote for it out, as iface does for DHCP.
+drop_manual() {
+	split_value "$(card_value "$1")" || return 0
+	! on_card_network "$(rc_get defaultrouter)" || rc -x defaultrouter >/dev/null ||
+		die "couldn't take defaultrouter out of rc.conf."
+	for _h in "$R/etc/start_if.$1" "$R/etc/stop_if.$1"; do
+		! { [ -e "$_h" ] && hook_ours "$_h" "$1"; } || rm -f "$_h" || die "couldn't remove $_h."
+	done
+}
+
+# Gives wired card $1 its own MAC address back if it has another's.
+own_mac() {
+	_hw=$(ifconfig "$1" 2>/dev/null | awk '$1 == "hwaddr" { print $2; exit }')
+	[ -z "$_hw" ] || ifconfig "$1" ether "$_hw" >/dev/null 2>&1 || true
+}
+
+# Takes card $1 out of a lagg: DHCP (WPA DHCP for a wlan) and, on the running
+# system unless it's off, its own MAC address, started.
+free_port() {
+	split_value "$(card_value "$1")" || true
+	if is_wlan "$1"; then
+		rc_set "$(ifconfig_var "$1")" "$(words "${wpa:-WPA}" DHCP $noauto)"
+	else
+		rc_set "$(ifconfig_var "$1")" DHCP
+	fi
+	[ -z "$R" ] && [ -z "$noauto" ] || return 0
+	is_wlan "$1" || own_mac "$1"
+	service netif start "$1" >/dev/null || die "couldn't start $1 (service netif start $1)."
+	start_dhcp "$1"
+}
+
+# lagg <laggN> failover|lacp|loadbalance|roundrobin <port>,<port>... dhcp | manual ...
+# lagg <laggN> remove
+lagg_cmd() {
+	[ $# -ge 2 ] || usage
+	lg=$1
+	shift
+	case $lg in
+	lagg[0-9] | lagg[0-9][0-9] | lagg[0-9][0-9][0-9]) ;;
+	*) die "\"$lg\" isn't a lagg's name (lagg0, lagg1 ...)." ;;
+	esac
+	lagg_var=$(ifconfig_var "$lg")
+	cloned=$(rc_get cloned_interfaces)
+	old=$(rc_get "$lagg_var")
+	listed=no
+	! has_word "$cloned" "$lg" || listed=yes
+	[ -z "$old" ] || split_value "$old" ||
+		die "$lagg_var is \"$old\", which has more than this changes (laggproto, laggports, up, DHCP or one IPv4 address); left as it is."
+	old_ports=$(lagg_ports "$old")
+	if [ "$1" = remove ]; then
+		[ $# -eq 1 ] || usage
+		lagg_remove
+		return 0
+	fi
+	[ $# -ge 3 ] || usage
+	proto=$1
+	ports=$(echo "$2" | tr , ' ')
+	shift 2
+	case $proto in
+	failover | lacp | loadbalance | roundrobin) ;;
+	*) die "\"$proto\" isn't a lagg mode this sets up (failover, lacp, loadbalance or roundrobin)." ;;
+	esac
+	[ "$listed" = yes ] || [ -n "$R" ] || ! ifconfig "$lg" >/dev/null 2>&1 ||
+		die "$lg is there but not in cloned_interfaces; left as it is."
+	seen=
+	wlan=
+	for _p in $ports; do
+		check_ifname "$_p"
+		[ "$_p" != "$lg" ] || die "$lg can't be a port of itself."
+		case " $seen " in
+		*" $_p "*) die "$_p is in the list twice." ;;
+		esac
+		seen="$seen $_p"
+		check_card "$_p" "$lg"
+		echo "$old_ports" | grep -qxF "$_p" || split_value "$(card_value "$_p")" ||
+			die "$(ifconfig_var "$_p") is \"$(card_value "$_p")\", set up by hand; left as it is."
+		[ -n "$wlan" ] || ! is_wlan "$_p" || wlan=$_p
+	done
+	[ "$(words $ports | wc -w)" -ge 2 ] || die "a lagg needs two cards or more."
+	iface_args "$lg" "$@"
+	check_hooks
+	mac=
+	if [ -n "$wlan" ]; then
+		mac=$(ifconfig "$wlan" 2>/dev/null | awk '$1 == "ether" { print $2; exit }')
+		[ -n "$mac" ] || die "couldn't read $wlan's MAC address (ifconfig $wlan)."
+	fi
+
+	for _p in $ports; do
+		drop_manual "$_p"
+		split_value "$(card_value "$_p")" || true
+		_v=$(ifconfig_var "$_p")
+		if is_wlan "$_p"; then
+			rc_set "$_v" "$(words "${wpa:-WPA}" $noauto)"
+		elif [ -n "$mac" ]; then
+			rc_set "$_v" "ether $mac"
+		else
+			rc_set "$_v" up
+		fi
+	done
+	[ "$listed" = yes ] || rc_set cloned_interfaces "$(words $cloned $lg)"
+	split_value "$old"
+	if [ -n "$cur_addr" ]; then
+		_address="inet $cur_addr${cur_len:+/$cur_len}"
+	else
+		_address=${dhcp:-DHCP}
+	fi
+	rc_set "$lagg_var" "$(words up laggproto "$proto" $(printf 'laggport %s ' $ports) $(lagg_others) $_address $noauto)"
+	echo "$lg is a $proto lagg of $(words $ports)."
+	if [ -z "$R" ]; then
+		# Stopping the lagg destroys it, taking its ports down.
+		service netif stop "$lg" >/dev/null 2>&1 || true
+		for _p in $ports; do
+			service netif stop "$_p" >/dev/null 2>&1 || true
+			dns_out "$_p"
+			[ -n "$mac" ] || is_wlan "$_p" || own_mac "$_p"
+			service netif start "$_p" >/dev/null || die "couldn't start $_p (service netif start $_p)."
+		done
+	fi
+	set_address
+	for _p in $old_ports; do
+		echo " $ports " | grep -qF " $_p " || free_port "$_p"
+	done
+}
+
+# Takes lagg lg out of rc.conf: its ports back on DHCP, its gateway and DNS
+# hooks gone; on the running system, destroyed.
+lagg_remove() {
+	[ "$listed" = yes ] && [ -n "$old" ] || die "$lg isn't a lagg in rc.conf."
+	if [ -z "$R" ]; then
+		service netif stop "$lg" >/dev/null 2>&1 || true
+		dns_out "$lg"
+	fi
+	drop_manual "$lg"
+	_left=$(for _c in $cloned; do [ "$_c" = "$lg" ] || echo "$_c"; done)
+	if [ -n "$_left" ]; then
+		rc_set cloned_interfaces "$(words $_left)"
+	else
+		rc -x cloned_interfaces >/dev/null || die "couldn't take cloned_interfaces out of rc.conf."
+	fi
+	rc -x "$lagg_var" >/dev/null || die "couldn't take $lagg_var out of rc.conf."
+	if [ -z "$R" ] && ifconfig "$lg" >/dev/null 2>&1; then
+		ifconfig "$lg" destroy >/dev/null || die "couldn't destroy $lg (ifconfig $lg destroy)."
+	fi
+	echo "$lg is gone; $(words $old_ports) get their addresses by DHCP."
+	for _p in $old_ports; do
+		free_port "$_p"
+	done
+}
+
+# iface-switch <if> on|off
+iface_switch() {
+	[ $# -eq 2 ] || usage
+	card=$1
+	case $2 in
+	on | off) ;;
+	*) usage ;;
+	esac
+	check_ifname "$card"
+	! is_wlan "$card" || die "Wi-Fi goes on and off with the Wi-Fi switch (wifi on|off)."
+	check_card "$card"
+	var=$(ifconfig_var "$card")
+	value=$(without_noauto "$(card_value "$card")")
+	if [ "$2" = off ]; then
+		rc_set "$var" "$(words $value NOAUTO)"
+		echo "$card is off."
+		[ -z "$R" ] || return 0
+		stop_card "$card"
+		return 0
+	fi
+	rc_set "$var" "$value"
+	echo "$card is on."
+	[ -z "$R" ] || return 0
+	[ "$changed" = yes ] || ! is_up "$card" || return 0
+	service netif start "$card" >/dev/null || die "couldn't start $card (service netif start $card)."
+	! has_word "$value" 'dhcp|syncdhcp|nosyncdhcp' || start_dhcp "$card"
+	router_if_none "$card" || die "couldn't add the default route through $router."
+}
+
+cmd=$1
+shift
+case $cmd in
+wifi-setup)
+	auto=no
+	OPTIND=1
+	while getopts a opt; do
+		case $opt in
+		a) auto=yes ;;
+		*) usage ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	[ $# -le 1 ] || usage
+	wifi_setup "$auto" "$@"
+	;;
+wifi)
+	[ $# -eq 1 ] || usage
+	case $1 in
+	on | off | toggle) wifi_switch "$1" ;;
+	*) usage ;;
+	esac
+	;;
+iface) iface "$@" ;;
+iface-switch) iface_switch "$@" ;;
+card-gone) card_gone "$@" ;;
+card-back) card_back "$@" ;;
+lagg) lagg_cmd "$@" ;;
+*) usage ;;
+esac

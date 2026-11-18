@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=HyprBSD Network
+GenericName=Network
+Comment=Join Wi-Fi networks
+Exec=hyprbsd-network
+Icon=hyprbsd-network
+Terminal=false
+Categories=Settings;Network;
+Keywords=wifi;wi-fi;wireless;network;internet;

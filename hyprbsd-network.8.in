@@ -1,0 +1,317 @@
+.\" SPDX-License-Identifier: BSD-2-Clause
+.Dd October 21, 2026
+.Dt HYPRBSD-NETWORK 8
+.Os
+.Sh NAME
+.Nm hyprbsd-network
+.Nd Wi-Fi networks and network card settings
+.Sh SYNOPSIS
+.Nm
+.Nm
+.Cm list
+.Op Fl -scan
+.Nm
+.Cm join
+.Op Fl -hidden
+.Ar name
+.Nm
+.Cm forget
+.Ar name
+.Nm
+.Cm status
+.Op Fl -follow
+.Sh DESCRIPTION
+.Nm
+lists, joins and forgets Wi-Fi networks through
+.Xr wpa_supplicant 8 Ns 's
+control socket, as a member of the
+.Ql wheel
+group, and says how the machine is connected.
+Its root helper,
+.Pa %%PREFIX%%/libexec/hyprbsd-network-helper ,
+sets Wi-Fi up for that; see
+.Sx FILES .
+Network names go to wpa_supplicant as bytes, in hex, and never through a shell.
+A password is hashed before wpa_supplicant sees it, so its file holds the key, not the
+password.
+.Pp
+Without a command,
+.Nm
+opens its window, or asks the one already open to come forward.
+The window lists the networks in range, strongest first, after the one joined, with their
+signal and a padlock on those that aren't open, then the saved networks out of range.
+A network that can't be joined, such as a WPA3-only one, says why.
+Selecting a network opens it:
+a new network with a password asks for it, then Connect joins it;
+a saved network has Connect, Forget, and Connect automatically, which says whether
+wpa_supplicant joins it by itself.
+A wrong password, or a network out of reach, is said in words, and nothing is saved until the
+network is joined.
+Other network\&... joins a network that hides its name.
+When it opens, and whenever wpa_supplicant starts again, the window scans unless a network is
+joined; while one is, the list is the last scan's, and says how long ago that was.
+Rescan scans at any time; while a network is joined that can drop the connection for a moment.
+The joined network has Disconnect, after which the window scans; wpa_supplicant then joins no
+network by itself until one is connected again.
+The switch beside it turns Wi-Fi off, and it stays off after a restart, or on again.
+Without Wi-Fi set up, the window offers Set up, which asks for an administrator's password;
+without a Wi-Fi adapter, it says so.
+.Pp
+The Interfaces tab, at the top beside Wi-Fi, lists the network cards: wired, Wi-Fi and USB ones
+(a phone sharing its connection is a USB card), whether each is connected and its address, a
+Wi-Fi adapter not set up yet, a PCI network card FreeBSD has no driver for, by its make, and a
+lagg with its ports.
+A card's switch turns it off, and it stays off after a restart, or on; a Wi-Fi card's is the
+Wi-Fi switch.
+Selecting a card opens its settings: Automatic (DHCP), or Manual with its address, prefix length
+(or netmask), gateway and up to three DNS servers.
+Apply checks them, then, after an administrator's password, puts them in
+.Xr rc.conf 5
+and in effect.
+The computer has one gateway: typed on a card, it moves from the card that had it, and the
+settings say so before Apply.
+New lagg, below the cards when two or more can be its ports, joins cards as one
+.Xr lagg 4 :
+its page has the mode (failover, LACP, load balance or round robin), the cards to be its
+ports, ticked in order (failover uses the first while it has a link), and the settings; Create
+makes it, after an administrator's password.
+Nothing on it is picked for you.
+With Wi-Fi among the ports, the wired ones take the Wi-Fi card's MAC address, and the page says
+so.
+Selecting a lagg opens the same page, with Apply, and Remove, which puts its ports back on
+DHCP.
+A lagg has no switch.
+A card that's part of a bridge or lagg says so and has no settings; one set up in rc.conf in
+ways the settings don't cover shows its rc.conf line instead, a lagg too.
+.Pp
+The keyboard works throughout: Tab moves between networks, cards and buttons, Enter or Space
+selects, and Escape closes the open network or card settings, then the window; while a network
+is being joined, forgotten or saved, or settings applied, Escape does nothing.
+.Pp
+The commands:
+.Bl -tag -width Ds
+.It Cm list Op Fl -scan
+The networks in range, strongest first, with their security, and which are saved or joined.
+It scans first unless a network is joined, or with
+.Fl -scan .
+.It Cm join Oo Fl -hidden Oc Ar name
+Joins the network and saves it.
+The password is the first line of standard input when that isn't a terminal (passwords are
+typed in the window); a saved network is joined without one.
+.Fl -hidden
+joins a network that hides its name.
+.It Cm forget Ar name
+Forgets every saved network with that name.
+.It Cm status Op Fl -follow
+How the machine is connected: through Wi-Fi, which network and how strong, or wired.
+With
+.Fl -follow
+it prints a line of JSON for
+.Xr waybar 5 Ns 's
+custom modules, and another each time the connection changes.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev HYPRBSD_NETWORK_CTRL_DIR
+wpa_supplicant's control socket directory, instead of
+.Pa /var/run/wpa_supplicant .
+.It Ev HYPRBSD_NETWORK_TRACE
+Set, the window writes on standard error, with the time, what wpa_supplicant tells it and what
+it shows, for bug reports.
+.It Ev XDG_RUNTIME_DIR
+Where
+.Nm
+makes its own sockets, and where the open window listens for a second start.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Oo Fl r Ar root Oc Cm wifi-setup Oo Fl a Oc Op Ar adapter
+Run as root, it gives the adapter (by default the first FreeBSD has attached) its wlan
+interface in
+.Xr rc.conf 5 ,
+with wpa_supplicant and DHCP, a control socket for
+.Ql wheel ,
+.Ql update_config=1 ,
+so the networks joined are saved,
+and
+.Ql bss_expiration_age=3600 ,
+so the networks a scan found stay listed for an hour; and
+.Ql wpa_supplicant_umask=077 ,
+so the file stays private.
+Other networks and settings in the file are kept.
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Oo Fl r Ar root Oc Cm wifi Cm on | off | toggle
+Run as root,
+.Cm off
+adds
+.Ql NOAUTO
+to every wlan in
+.Xr rc.conf 5
+that uses wpa_supplicant, so it stays down after a restart, and stops it, taking its DNS
+servers out of
+.Xr resolvconf 8
+and handing the default route on as
+.Cm card-gone
+does;
+.Cm on
+takes
+.Ql NOAUTO
+out and starts it;
+.Cm toggle
+turns Wi-Fi off while one of them is on, and on when all are off.
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Oo Fl r Ar root Oc Cm iface Ar interface Cm dhcp
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Oo Fl r Ar root Oc Cm iface Ar interface Cm manual Ar address Ns / Ns Ar len Oo Ar gateway | Cm - Oc Op Ar dns ...
+Run as root, sets the card's
+.Va ifconfig_ Ns Ar interface
+in
+.Xr rc.conf 5
+to DHCP or the address, keeping
+.Ql WPA ,
+.Ql NOAUTO ,
+.Ql up ,
+.Ql mtu
+and
+.Ql accept_rtadv ;
+a line with any other setting is left as it is.
+A gateway becomes
+.Va defaultrouter ,
+taken from the card that had it; no gateway takes away this card's.
+DNS servers go to
+.Xr resolvconf 8
+from
+.Pa /etc/start_if. Ns Ar interface
+and
+.Pa /etc/stop_if. Ns Ar interface ,
+which
+.Pa /etc/rc.d/netif
+runs as it starts and stops the card.
+It checks every value first.
+On the running system it stops the card with its old settings, their DNS servers going with
+them, and starts it with the new.
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Oo Fl r Ar root Oc Cm iface-switch Ar interface Cm on | off
+Run as root,
+.Cm off
+adds
+.Ql NOAUTO
+to the card's line, so it stays down after a restart, and stops it as
+.Cm wifi off
+stops a wlan;
+.Cm on
+takes
+.Ql NOAUTO
+out and starts it.
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Oo Fl r Ar root Oc Cm lagg Ar laggN mode port,port,... Cm dhcp | manual ...
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Oo Fl r Ar root Oc Cm lagg Ar laggN Cm remove
+Run as root, makes or changes the lagg
+.Ar laggN
+in mode
+.Cm failover ,
+.Cm lacp ,
+.Cm loadbalance
+or
+.Cm roundrobin
+with the ports in that order, addressed as
+.Cm iface
+addresses a card: it goes in
+.Va cloned_interfaces ,
+its line is
+.Ql up laggproto Ar mode Ql laggport Ar port ...
+with the address and the
+.Ql mtu
+and
+.Ql accept_rtadv
+it had, each port's line
+.Ql up ,
+a wlan's
+.Ql WPA ,
+and with a wlan among the ports, a wired port's
+.Ql ether
+with the wlan's MAC address.
+A port it no longer has goes back to DHCP.
+.Cm remove
+takes the lagg out of
+.Xr rc.conf 5 ,
+with its gateway and DNS hooks, and puts its ports back on DHCP.
+It checks everything first, and leaves a lagg or port set up by hand as it is.
+On the running system it stops the lagg, restarts the ports and starts the lagg;
+.Cm remove
+destroys the lagg, and a wired port gets its own MAC address back.
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Cm card-gone Ar interface
+Run as root by
+.Xr devd 8
+when a card's link goes down or the card goes away, and by
+.Pa /etc/dhclient-exit-hooks
+when its lease ends.
+A card that is down or without a link keeps its addresses, but one on the network of
+another card with a link becomes a /32 (a Manual card's, if it is the one in
+.Xr rc.conf 5 )
+until dhclient or
+.Cm card-back
+sets it again.
+If the default route went through the card, or there is none, the route and the card's
+DNS servers from DHCP go, and the route goes to the first other card that is up with a
+link and takes it: a DHCP card asks for its lease again, and a Manual card on the network of
+.Va defaultrouter
+gets that.
+If no card takes it, a Manual card keeps the route.
+A card without a link loses its Manual DNS servers unless the route still goes through it.
+Then, as after
+.Cm iface
+and switching off, the card the route goes through gets its DNS servers back into
+.Xr resolvconf 8
+if they are not there: a DHCP card asks for its lease again, and a Manual card runs its
+.Pa /etc/start_if. Ns Ar interface
+again.
+.It Pa %%PREFIX%%/libexec/hyprbsd-network-helper Cm card-back Ar interface
+Run as root by
+.Xr devd 8
+when a card's link comes back; it does nothing if the card is down or without a link by the
+time it runs.
+A Manual card's address from
+.Xr rc.conf 5
+at /32 gets its prefix length back; with no default route, the card gets
+.Va defaultrouter
+if that is on its network; its DNS servers go back in from the
+.Pa /etc/start_if. Ns Ar interface
+that
+.Cm iface
+wrote.
+Then, as after
+.Cm card-gone ,
+the card the route goes through gets its DNS servers.
+A DHCP card is left to dhclient.
+.It Pa %%PREFIX%%/share/polkit-1/actions/org.hyprbsd.network.policy
+.It Pa %%PREFIX%%/share/polkit-1/rules.d/50-hyprbsd-network.rules
+Who may run the helper through
+.Xr pkexec 1 :
+members of
+.Ql wheel
+at the computer,
+.Cm wifi
+and
+.Cm iface-switch
+without a password,
+.Cm wifi-setup ,
+.Cm iface
+and
+.Cm lagg
+after an administrator's.
+.It Pa %%PREFIX%%/etc/devd/hyprbsd-network.conf
+Sets a Wi-Fi adapter up the same way when it attaches, unless another attached adapter
+has Wi-Fi or
+.Xr rc.conf 5
+has
+.Ql hyprbsd_network_autosetup="NO" .
+The Wi-Fi line of an adapter that is no longer attached moves to the one that attaches,
+with its wlan and settings.
+.It Pa /etc/wpa_supplicant.conf
+The saved networks.
+.El
+.Sh EXIT STATUS
+.Ex -std
+Usage errors exit 2.
+.Sh SEE ALSO
+.Xr rc.conf 5 ,
+.Xr wpa_supplicant.conf 5 ,
+.Xr ifconfig 8 ,
+.Xr resolvconf 8 ,
+.Xr wpa_supplicant 8

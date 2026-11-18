@@ -1,0 +1,262 @@
+#!/bin/sh
+#
+# hyprbsd-network's cards in a bhyve guest, one stage a boot, from rc.local:
+#
+#   2  the test networks (DHCP from the jail hnetdhcp, none of the addresses
+#      in /root/hnet-outside reachable), net.route.multipath 0 as set up,
+#      the cards' MTU and options recorded, polkit's actions and hyprbsd-network
+#      without Wi-Fi; then vtnet1, on DHCP
+#      from rc.conf, through the helper's iface: Manual with gateway and DNS,
+#      DHCP again, and Manual again
+#   3  Manual kept; then iface-switch off
+#   4  still off; then iface-switch on
+#   5  still on; then the window from the keyboard: Automatic, then Manual
+#   6  the window's Manual kept
+#
+# The boot's number is in /var/db/hnet-test-boot; the stage ends with
+# "@@cards-<boot> done status=<failed checks>".
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+. /root/checks.sh
+
+card=vtnet1
+# vtnet1's network, on switch B; vtnet0's is 10.78.1.0/24, on switch A.
+net=10.78.2
+
+line_is() {
+	[ "$(sysrc -n "ifconfig_$card")" = "$1" ] || got "ifconfig_$card is '$(sysrc -n "ifconfig_$card")', not '$1'"
+}
+
+# The card there, down, with no IPv4 address.
+card_down() {
+	_out=$(ifconfig "$card" 2>&1) || got "ifconfig $card: $_out" || return
+	case $(printf '%s\n' "$_out" | head -n 1) in
+	*'<UP,'* | *'<UP>'*) got "$card is up: $(printf '%s\n' "$_out" | head -n 1)" ;;
+	esac || return
+	! printf '%s\n' "$_out" | grep -q '^[[:space:]]*inet ' || got "$card still has $(addr_of "$card")"
+}
+
+card_up() {
+	ifconfig "$card" | head -n 1 | grep -q '<UP[,>]' || got "$card isn't up"
+}
+
+# Manual with gateway and DNS in effect: the address, defaultrouter, the DNS
+# server in resolv.conf and an answer from the gateway.
+manual_in_effect() {
+	_why=
+	[ "$(addr_of "$card")" = "$net.50" ] || _why="address '$(addr_of "$card")'"
+	[ "$(sysrc -n defaultrouter)" = "$net.1" ] || _why="$_why, defaultrouter '$(sysrc -n defaultrouter)'"
+	grep -qx "nameserver $net.1" /etc/resolv.conf || _why="$_why, no nameserver $net.1 in resolv.conf"
+	ping -q -c 1 -t 5 "$net.1" >/dev/null 2>&1 || _why="$_why, no answer from $net.1"
+	[ -z "$_why" ] || got "${_why#, }"
+}
+
+default_via() {
+	[ "$(gateway)" = "$1" ] || got "the default route goes through '$(gateway)', not $1"
+}
+
+not_default_via() {
+	[ "$(gateway)" != "$1" ] || got "the default route still goes through $1"
+}
+
+no_nameserver() {
+	! grep -qx "nameserver $1" /etc/resolv.conf || got "resolv.conf still has nameserver $1"
+}
+
+dns_answers() {
+	_out=$(host -t A gw.hnet.test "$1" 2>&1)
+	case $_out in
+	*'has address 10.78.1.1'*) ;;
+	*) got "DNS at $1: $_out" ;;
+	esac
+}
+
+# A ping sent to the address got no answer (ping's status 2, nothing it
+# couldn't send).
+unreachable() {
+	_st=0
+	_ping=$(ping -c 1 -t 2 "$1" 2>&1) || _st=$?
+	case $_st:$_ping in
+	0:*) got "$1 answered" ;;
+	2:*sendto:*) got "ping couldn't send to $1: $(printf '%s\n' "$_ping" | grep sendto: | head -n 1)" ;;
+	2:*) ;;
+	*) got "ping couldn't probe $1 (status $_st): $(printf '%s\n' "$_ping" | tail -n 1)" ;;
+	esac
+}
+
+no_ipv6_default() {
+	! route -n get -inet6 default >/dev/null 2>&1 || got "an IPv6 default route: $(route -n get -inet6 default 2>&1 | grep -E 'gateway|interface' | tr '\n' ' ')"
+}
+
+# The test networks: the jail answers on both, with DNS; then none of the
+# IPv4 addresses in /root/hnet-outside answers, and the guest has no IPv6
+# default route; the host's IPv6 addresses in /root/hnet-outside6 aren't
+# probed.
+networks() {
+	fixture "vtnet0 vtnet1"
+	for _gw in 10.78.1.1 10.78.2.1; do
+		check "the jail answers at $_gw" ping -q -c 1 -t 5 "$_gw"
+		check "the jail's DNS server answers at $_gw" dns_answers "$_gw"
+	done
+	while read -r _out; do
+		check "$_out doesn't answer" unreachable "$_out"
+	done </root/hnet-outside
+	netstat -rn -f inet6 | sed 's/^/@@seen IPv6 route: /'
+	check "the guest has no IPv6 default route" no_ipv6_default
+	echo "@@seen IPv6 reachability not exercised; the host's IPv6 addresses: $(paste -s -d ' ' /root/hnet-outside6)"
+}
+
+cards_recorded() {
+	for _c in vtnet0 vtnet1; do
+		echo "@@seen $_c: $(ifconfig "$_c" | sed -n 's/^[[:space:]]*options=/options=/p; s/.* \(mtu [0-9]*\)$/\1/p' | paste -s -d ' ' -)"
+	done
+}
+
+# pkaction_has <action> <argv1>: polkit's action runs the installed helper with
+# that first argument, and its implicit authorizations, which rules can
+# override, are an administrator's password kept a while for an active
+# session and no for any other.
+pkaction_has() {
+	_out=$(pkaction --verbose --action-id "org.hyprbsd.network.$1" 2>&1) || got "pkaction: $_out" || return
+	for _want in "policykit\.exec\.path -> $helper" "policykit\.exec\.argv1 -> $2" 'implicit any: +no' \
+		'implicit inactive: +no' 'implicit active: +auth_admin_keep'; do
+		printf '%s\n' "$_out" | grep -q -E "$_want\$" || got "org.hyprbsd.network.$1 lacks '$_want'" || return
+	done
+}
+
+polkit_actions() {
+	check "polkit's rule for the helper is installed" test -f /usr/local/share/polkit-1/rules.d/50-hyprbsd-network.rules
+	for _a in wifi:wifi setup:wifi-setup iface-switch:iface-switch iface:iface lagg:lagg; do
+		check "polkit's org.hyprbsd.network.${_a%%:*}: the helper's ${_a#*:}, implicitly auth_admin_keep" \
+			pkaction_has "${_a%%:*}" "${_a#*:}"
+	done
+}
+
+no_wifi_lines() {
+	! sysrc -a | grep -q '^wlans_' || got "rc.conf has $(sysrc -a | grep '^wlans_')" || return
+	[ -z "$(sysrc -n wpa_supplicant_umask 2>/dev/null)" ] || got "rc.conf has wpa_supplicant_umask" || return
+	! grep -qs '^update_config=1' /etc/wpa_supplicant.conf || got "/etc/wpa_supplicant.conf was written"
+}
+
+without_wifi() {
+	check "the guest has no Wi-Fi adapter" sh -c '[ -z "$(sysctl -n net.wlan.devices)" ]'
+	check "wifi-setup without an adapter says so" said 'No Wi-Fi adapter' "$("$helper" wifi-setup 2>&1)"
+	check "and sets nothing up" no_wifi_lines
+	check "$user's hyprbsd-network status names the wired card" said 'Wired: vtnet' "$(as_user_network status 2>&1)"
+	check "$user's hyprbsd-network list says Wi-Fi isn't set up" said "Wi-Fi isn't set up" "$(as_user_network list 2>&1)"
+}
+
+iface_manual() {
+	helper_runs iface "$card" manual "$net.50/24" "$net.1" "$net.1" && wait_addr "$card" "$net.50" 20 &&
+		manual_in_effect && default_via "$net.1" && line_is "inet $net.50/24"
+}
+
+iface_dhcp() {
+	helper_runs iface "$card" dhcp && line_is DHCP && wait_addr "$card" "$net.1[0-9][0-9]" 60
+}
+
+switch_off() {
+	helper_runs iface-switch "$card" off && card_down && line_is "inet $net.50/24 NOAUTO" &&
+		no_nameserver "$net.1" && not_default_via "$net.1"
+}
+
+switch_on() {
+	helper_runs iface-switch "$card" on && wait_addr "$card" "$net.50" 20 && card_up && line_is "inet $net.50/24"
+}
+
+on_kept() {
+	card_up && [ "$(addr_of "$card")" = "$net.50" ] || got "$card has '$(addr_of "$card")', not $net.50"
+}
+
+# applied <n> <seconds>: the window's trace has n helper runs that ended Done
+# within the time.
+applied() {
+	_i=0
+	while [ "$(grep -c 'the helper ended: Done' "$RUN/window.log")" -lt "$1" ] && [ $_i -lt "$2" ]; do
+		sleep 1
+		_i=$((_i + 1))
+	done
+	[ "$(grep -c 'the helper ended: Done' "$RUN/window.log")" -ge "$1" ] ||
+		got "the window's Apply didn't end Done in $2 s: $(grep 'the helper' "$RUN/window.log" | tail -n 2 | tr '\n' ' ')"
+}
+
+window_automatic() {
+	wait_addr "$card" "$net.1[0-9][0-9]" 60 && line_is DHCP && applied 1 90
+}
+
+window_manual() {
+	wait_addr "$card" "$net.60" 30 && line_is "inet $net.60/24" && applied 2 90
+}
+
+# As $user, with a polkit rule of the test's letting $user run iface without
+# a password: the window's Interfaces tab, vtnet1's settings, Automatic and
+# Apply; then Manual, an address typed, and Apply.
+window() {
+	window_start || return
+	# Shift+Tab with nothing focused reaches the last widget: the Interfaces tab.
+	as_user "wtype -M shift -k Tab -m shift"
+	keys space
+	sleep 1
+	shot iface-list
+	# vtnet0's row and switch, then vtnet1's row, opened.
+	keys Tab Tab Tab Return
+	shot iface-settings
+	# Back, Automatic chosen; Manual, then Apply.
+	keys Tab Tab space Tab Tab space
+	check "the window's Automatic gives vtnet1 an address by DHCP through pkexec" window_automatic
+	sleep 6
+	shot iface-automatic
+	# The keyboard is back on vtnet1's row: opened again, Manual chosen (its
+	# prefix filled in from DHCP's address), its address typed; past the
+	# prefix, gateway and DNS to Apply.
+	keys Return Tab Tab Tab space Tab
+	as_user "wtype $net.60"
+	shot iface-manual-typed
+	keys Tab Tab Tab Tab space
+	check "the window's Manual gives vtnet1 the typed address through pkexec" window_manual
+	awk '/ the helper: / { start = $2 } / the helper ended: / { printf "@@seen an Apply: %.1f s\n", $2 - start }' \
+		"$RUN/window.log"
+	sleep 6
+	shot iface-manual
+	window_stop
+}
+
+boot=$(cat /var/db/hnet-test-boot)
+echo "@@cards-$boot start"
+case $boot in
+2)
+	networks
+	check "net.route.multipath is 0, as a distribution sets it" sh -c '[ "$(sysctl -n net.route.multipath)" = 0 ]'
+	cards_recorded
+	polkit_actions
+	without_wifi
+	check "Manual with gateway and DNS: the address, the default route, defaultrouter, resolv.conf" iface_manual
+	check "the helper's iface dhcp gives vtnet1 an address by DHCP again" iface_dhcp
+	check "and Manual again" iface_manual
+	;;
+3)
+	echo "@@seen the default route after a restart: through '$(gateway)'"
+	check "Manual kept after a restart" manual_in_effect
+	check "iface-switch off: down, NOAUTO, its DNS server and default route gone" switch_off
+	;;
+4)
+	check "still off after a restart" card_down
+	check "iface-switch on: up with its address" switch_on
+	;;
+5)
+	check "still on after a restart" on_kept
+	window
+	shots
+	;;
+6)
+	check "the window's Manual address kept after a restart" wait_addr "$card" "$net.60" 30
+	networks
+	;;
+*)
+	echo "@@check FAIL a stage for boot $boot"
+	failures=1
+	;;
+esac
+echo "@@cards-$boot done status=$failures"
+echo $((boot + 1)) >/var/db/hnet-test-boot

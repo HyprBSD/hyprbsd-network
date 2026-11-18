@@ -1,0 +1,69 @@
+#!/bin/sh
+#
+# The test networks' DHCP and DNS, before netif starts the guest's cards: a
+# vnet jail, hnetdhcp, takes vtnet2 (10.78.1.1/24, switch A with vtnet0) and
+# vtnet3 (10.78.2.1/24, switch B with vtnet1) and runs dnsmasq on them.
+# Prints "@@dhcp ready ..." once dnsmasq listens for DHCP, within 20 s, or
+# "@@dhcp failed: ..." with the jail removed.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+# PROVIDE: hnetdhcp
+# REQUIRE: FILESYSTEMS ldconfig
+# BEFORE: netif
+
+. /etc/rc.subr
+
+name=hnetdhcp
+rcvar=hnetdhcp_enable
+start_cmd=hnetdhcp_start
+stop_cmd=hnetdhcp_stop
+
+hnetdhcp_pid=/var/run/hnetdhcp-dnsmasq.pid
+hnetdhcp_err=/var/run/hnetdhcp.err
+
+hnetdhcp_failed() {
+	echo "@@dhcp failed: $*"
+	jail -r hnetdhcp >/dev/null 2>&1 || true
+	return 1
+}
+
+# hnetdhcp_run <what> <command...>: the command, or hnetdhcp_failed with its
+# output.
+hnetdhcp_run() {
+	_what=$1
+	shift
+	"$@" >"$hnetdhcp_err" 2>&1 || hnetdhcp_failed "$_what: $(tr '\n' ' ' <"$hnetdhcp_err")"
+}
+
+hnetdhcp_start() {
+	_t0=$(date +%s)
+	hnetdhcp_run "the jail" jail -c name=hnetdhcp path=/ host.hostname=hnetdhcp vnet persist \
+		vnet.interface=vtnet2 vnet.interface=vtnet3 || return 1
+	hnetdhcp_run "lo0" jexec hnetdhcp ifconfig lo0 inet 127.0.0.1/8 up || return 1
+	hnetdhcp_run "vtnet2" jexec hnetdhcp ifconfig vtnet2 inet 10.78.1.1/24 up || return 1
+	hnetdhcp_run "vtnet3" jexec hnetdhcp ifconfig vtnet3 inet 10.78.2.1/24 up || return 1
+	rm -f "$hnetdhcp_pid"
+	hnetdhcp_run dnsmasq jexec hnetdhcp /usr/local/sbin/dnsmasq --bind-interfaces \
+		--interface=vtnet2 --interface=vtnet3 --except-interface=lo0 --no-resolv --no-hosts --no-ping \
+		--dhcp-range=10.78.1.100,10.78.1.199,1h --dhcp-range=10.78.2.100,10.78.2.199,1h \
+		--dhcp-leasefile=/var/db/hnetdhcp.leases --pid-file="$hnetdhcp_pid" \
+		--address=/gw.hnet.test/10.78.1.1 --log-dhcp --log-facility=/var/log/hnetdhcp.log || return 1
+	_i=0
+	while [ $_i -lt 40 ]; do
+		if [ -s "$hnetdhcp_pid" ] && jexec hnetdhcp sockstat -4 -l -p 67 | grep -q '^[^ ]* *dnsmasq '; then
+			echo "@@dhcp ready after $(($(date +%s) - _t0)) s; the jail's cards: $(jexec hnetdhcp ifconfig -l)"
+			return 0
+		fi
+		sleep 0.5
+		_i=$((_i + 1))
+	done
+	hnetdhcp_failed "dnsmasq isn't listening after 20 s: $(tail -n 3 /var/log/hnetdhcp.log 2>/dev/null | tr '\n' ' ')"
+}
+
+hnetdhcp_stop() {
+	jail -r hnetdhcp
+}
+
+load_rc_config $name
+run_rc_command "$1"

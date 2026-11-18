@@ -1,0 +1,31 @@
+#!/bin/sh
+#
+# The Wi-Fi test's stopped wpa_supplicant, standing in for one stuck in the
+# driver: at the start, after netif has started wlan0's wpa_supplicant and
+# before devd, sends it SIGSTOP
+# (stop_supplicant, /root/stuck.sh) and records its pid in /var/db/hnet-stuck,
+# or prints a failed check saying why.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+# PROVIDE: hnetteststuck
+# REQUIRE: netif
+# BEFORE: devd
+
+. /etc/rc.subr
+. /root/stuck.sh
+
+name=hnetteststuck
+start_cmd=hnetteststuck_start
+stop_cmd=:
+
+hnetteststuck_start() {
+	if _out=$(stop_supplicant /var/run/wpa_supplicant/wlan0.pid /var/run/devd.pid /var/db/hnet-stuck 10); then
+		echo "@@seen wpa_supplicant ($_out) stopped before devd started"
+	else
+		echo "@@check FAIL wpa_supplicant stopped before devd started"
+		echo "@@got $_out"
+	fi
+}
+
+run_rc_command "$1"

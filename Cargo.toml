@@ -1,0 +1,20 @@
+[package]
+name = "hyprbsd-network"
+version = "0.2.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Wi-Fi and network settings for FreeBSD desktops"
+publish = false
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland"] }
+libc = "0.2"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+serde_json = "1"
+sha1 = { version = "0.10", default-features = false }
+thiserror = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

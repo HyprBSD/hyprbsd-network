@@ -1,0 +1,4 @@
+# Core dumps
+*.core
+# cargo's builds
+/target/

@@ -1,0 +1,409 @@
+#!/bin/sh
+#
+# hyprbsd-network's Wi-Fi in a bhyve guest with a Wi-Fi card lent to it, one
+# stage a boot, from rc.local:
+#
+#   2  the card attached, not set up before this start, and devd's rule set
+#      it up; then the settings taken out but the wlan left, as Wi-Fi set up
+#      by hand, and wpa_supplicant to be stopped at the next start
+#   3  wpa_supplicant stopped with SIGSTOP before devd started, the start
+#      finished, the settings are back and nothing was restarted;
+#      wpa_supplicant as it was from the next start
+#   4  wpa_supplicant with the settings devd's rule put back;
+#      then $user joins the network; the window (Connect automatically off
+#      and on, Disconnect); the helper's wifi off and on as root, which the
+#      window's switch runs through pkexec: on in the same session, and on
+#      with wlan0 made but not started, as rc leaves it at boot; a second
+#      start of the window; the commands (list, status, a wrong password)
+#   5  the network joined again by itself, with the socket and private file
+#
+# The boot's number is in /var/db/hnet-test-boot; the stage ends with
+# "@@wifi-<boot> done status=<failed checks>". The network's name is in
+# /root/hnet-wifi-ssid, its passphrase in /root/hnet-wifi-psk; boot 1's
+# record of the Wi-Fi settings is in /var/db/hnet-wifi-before.
+#
+# SPDX-License-Identifier: BSD-2-Clause
+
+. /root/checks.sh
+. /root/stuck.sh
+
+WIFI_CONF=/etc/wpa_supplicant.conf
+WIFI_CTRL=/var/run/wpa_supplicant
+wifi_ssid=$(cat /root/hnet-wifi-ssid)
+# The network's name, for su's shell to expand in "join".
+WIFI_SSID=$wifi_ssid
+export WIFI_SSID
+
+# wpa_cli on wlan0 as $user, the request in $1.
+wpa_as_user() {
+	su -m "$user" -c "wpa_cli -p $WIFI_CTRL -i wlan0 $1"
+}
+
+wpa_state() {
+	wpa_as_user status | sed -n 's/^wpa_state=//p'
+}
+
+adapter() {
+	sysctl -n net.wlan.devices | awk '{ print $1 }'
+}
+
+# The lent card is the guest's one Wi-Fi adapter.
+adapter_attached() {
+	_all=$(sysctl -n net.wlan.devices)
+	[ -n "$_all" ] && [ "$(echo $_all | wc -w)" -eq 1 ] || got "net.wlan.devices is '$_all', not one adapter"
+}
+
+# Boot 1's record of rc.conf's wlans_ and wpa_supplicant_ lines and
+# wpa_supplicant.conf's update_config is there and empty.
+not_set_up_before() {
+	[ -f /var/db/hnet-wifi-before ] || got "boot 1 left no /var/db/hnet-wifi-before" || return
+	[ ! -s /var/db/hnet-wifi-before ] || got "before this start: $(tr '\n' ' ' </var/db/hnet-wifi-before)"
+}
+
+# hyprbsd-network's devd rule as make install rendered it.
+rule_installed() {
+	cmp -s /usr/local/etc/devd/hyprbsd-network.conf /root/hnet-devd-rule ||
+		got "/usr/local/etc/devd/hyprbsd-network.conf isn't the rule make install rendered"
+}
+
+# wpa_supplicant.conf's lines, without keys.
+conf_lines() {
+	grep -v -i -E 'psk|password|key' "$WIFI_CONF" 2>/dev/null | tr '\n' ' '
+}
+
+# wlan0 associated with $wifi_ssid and with an address, within 120 s.
+wifi_up() {
+	_i=0
+	while [ $_i -lt 60 ]; do
+		if ifconfig wlan0 2>/dev/null | grep -q 'status: associated' &&
+			ifconfig wlan0 | grep -qF -e "ssid $wifi_ssid " -e "ssid \"$wifi_ssid\" " &&
+			ifconfig wlan0 inet | grep -q 'inet '; then
+			return 0
+		fi
+		sleep 2
+		_i=$((_i + 1))
+	done
+	got "wlan0 isn't associated with an address after 120 s: $(ifconfig wlan0 2>&1 | grep -E 'status|ssid|inet ' | tr '\n' ' ')"
+}
+
+wifi_router() {
+	sed -n 's/^[[:space:]]*option routers \([0-9.]*\).*/\1/p' /var/db/dhclient.leases.wlan0 2>/dev/null | tail -n 1
+}
+
+# The router in wlan0's DHCP lease answers a ping from wlan0's address.
+wifi_route() {
+	_addr=$(addr_of wlan0)
+	_router=$(wifi_router)
+	[ -n "$_addr" ] && [ -n "$_router" ] && ping -c 1 -t 5 -S "$_addr" "$_router" >/dev/null ||
+		got "no answer from wlan0's router '$_router' at '$_addr'"
+}
+
+# wpa_supplicant's state, saved networks and last log lines.
+wifi_state() {
+	wpa_as_user status | sed 's/^/@@seen wpa_supplicant /'
+	wpa_as_user list_networks | sed 's/^/@@seen wpa_supplicant /'
+	grep wpa_supplicant /var/log/messages | tail -n 20 | sed 's/^/@@seen /'
+}
+
+# Within 60 s of the start: devd's rule set the adapter up and started wlan0.
+devd_set_up() {
+	_i=0
+	while [ $_i -lt 30 ] && ! ifconfig wlan0 >/dev/null 2>&1; do
+		sleep 2
+		_i=$((_i + 1))
+	done
+	_dev=$(adapter)
+	_wlans=$(sysrc -n "wlans_$_dev" 2>/dev/null || true)
+	[ -n "$_dev" ] && [ "$_wlans" = wlan0 ] && grep -qx update_config=1 "$WIFI_CONF" && ifconfig wlan0 >/dev/null 2>&1 ||
+		got "adapter '$_dev', wlans_$_dev '$_wlans', wlan0 $(ifconfig wlan0 >/dev/null 2>&1 && echo there || echo missing)"
+}
+
+# The wlan left in rc.conf, hyprbsd-network's settings taken out, as Wi-Fi
+# set up by hand: wpa_supplicant.conf with a line of its own (ap_scan) and
+# without the socket or saving, no umask. At the next start hnetteststuck stops
+# wpa_supplicant with SIGSTOP after netif starts it, before devd, standing in
+# for one stuck in the driver.
+strip_and_stick() {
+	sysrc -x wpa_supplicant_umask 2>/dev/null || true
+	printf 'ap_scan=1\n' >"$WIFI_CONF"
+	install -m 0555 /root/hnetteststuck /usr/local/etc/rc.d/hnetteststuck
+	_wlans=$(sysrc -n "wlans_$(adapter)" 2>/dev/null || true)
+	[ -z "$(sysrc -n wpa_supplicant_umask 2>/dev/null)" ] && [ "$(cat "$WIFI_CONF")" = ap_scan=1 ] &&
+		[ "$_wlans" = wlan0 ] && [ -x /usr/local/etc/rc.d/hnetteststuck ] ||
+		got "umask '$(sysrc -n wpa_supplicant_umask 2>/dev/null)', wlans_ '$_wlans', file: $(conf_lines)"
+}
+
+# hnetteststuck's record: wlan0's wpa_supplicant, stopped before devd
+# started, and still stopped.
+stuck_before_devd() {
+	[ -s /var/db/hnet-stuck ] || got "hnetteststuck recorded nothing in /var/db/hnet-stuck" || return
+	_pid=$(supplicant_in /var/db/hnet-stuck) || got "$_pid" || return
+	is_stopped "$_pid" || got "wpa_supplicant ($_pid) isn't stopped: state '$(ps -o state= -p "$_pid")'"
+}
+
+# The start finished (this runs from rc.local), devd's rule put the settings
+# back, keeping the file's own ap_scan line, and nothing is stopping or
+# restarting wpa_supplicant.
+devd_put_back() {
+	[ "$(sysrc -n wpa_supplicant_umask 2>/dev/null)" = 077 ] && grep -qx update_config=1 "$WIFI_CONF" &&
+		grep -qx ap_scan=1 "$WIFI_CONF" &&
+		! pgrep -f 'wpa_supplicant (restart|stop)' >/dev/null ||
+		got "umask '$(sysrc -n wpa_supplicant_umask 2>/dev/null)', $(pgrep -lf 'wpa_supplicant (restart|stop)' | tr '\n' ' ')file: $(conf_lines)"
+}
+
+unstick() {
+	rm -f /usr/local/etc/rc.d/hnetteststuck /var/db/hnet-stuck
+	pkill -9 -f 'wpa_supplicant (restart|stop)' || true
+	pkill -9 -x wpa_supplicant || true
+}
+
+# Within 60 s of the start: wpa_supplicant has wheel's socket and the
+# settings devd's rule put back, the file's own ap_scan line kept.
+settings_in_use() {
+	_i=0
+	while [ $_i -lt 30 ] && ! [ -S "$WIFI_CTRL/wlan0" ]; do
+		sleep 2
+		_i=$((_i + 1))
+	done
+	_umask=$(sysrc -n wpa_supplicant_umask 2>/dev/null || true)
+	_group=$(stat -f %Sg "$WIFI_CTRL/wlan0" 2>/dev/null || true)
+	[ "$_umask" = 077 ] && grep -qx update_config=1 "$WIFI_CONF" && grep -qx ap_scan=1 "$WIFI_CONF" &&
+		[ "$_group" = wheel ] ||
+		got "umask '$_umask', socket group '$_group', file: $(conf_lines)"
+}
+
+# $user joins $wifi_ssid with hyprbsd-network join, the passphrase on
+# standard input, then has an address and a working route.
+join() {
+	_out=$(as_user_network 'join "$WIFI_SSID"' </root/hnet-wifi-psk 2>&1) ||
+		{ wifi_state; got "hyprbsd-network join said: $_out"; } || return
+	wifi_up && wifi_route
+}
+
+# $user's hyprbsd-network list shows $wifi_ssid joined, within 60 s.
+listed() {
+	_i=0
+	while [ $_i -lt 30 ]; do
+		as_user_network list 2>/dev/null | grep -qF "  $wifi_ssid (connected)" && return 0
+		sleep 2
+		_i=$((_i + 1))
+	done
+	got "list: $(as_user_network list 2>&1 | tr '\n' ' ')"
+}
+
+# With the default route on vtnet0, status says Wired; moved to wlan0's
+# router, status says Wi-Fi and status --follow's first line has the wifi
+# class.
+status_follows() {
+	said "Wired: " "$(as_user_network status 2>&1)" || return
+	_gateway=$(gateway)
+	route change default "$(wifi_router)" >/dev/null
+	_status=$(as_user_network status 2>&1)
+	_bar=$(as_user_network "status --follow & sleep 3; kill \$!" 2>&1 | head -n 1)
+	route change default "$_gateway" >/dev/null
+	said "Wi-Fi: $wifi_ssid" "$_status" && said '"class":"wifi"' "$_bar"
+}
+
+# A join with a wrong passphrase fails in words and leaves
+# wpa_supplicant.conf, and wpa_supplicant's networks, as they were, none
+# disabled.
+wrong_password() {
+	cp "$WIFI_CONF" /tmp/hnet-wifi-conf
+	_networks=$(wpa_as_user list_networks | tail -n +2 | cut -f 1,2)
+	if _out=$(printf 'not the password\n' | as_user_network 'join "$WIFI_SSID"' 2>&1); then
+		got "a wrong password joined: $_out"
+		return
+	fi
+	said "the password is wrong" "$_out" || return
+	cmp -s "$WIFI_CONF" /tmp/hnet-wifi-conf || got "a wrong password changed $WIFI_CONF" || return
+	[ "$(wpa_as_user list_networks | tail -n +2 | cut -f 1,2)" = "$_networks" ] ||
+		{ wifi_state; got "wpa_supplicant's networks aren't the ones before"; } || return
+	! wpa_as_user list_networks | grep -qF '[DISABLED]' || got "a network is left disabled"
+}
+
+# Whether $wifi_ssid's network in wpa_supplicant.conf is joined
+# automatically ("on") or has disabled=1 ("off"), within 30 s.
+autoconnect() {
+	_i=0
+	while [ $_i -lt 30 ]; do
+		_now=$(awk -v ssid="ssid=\"$wifi_ssid\"" '
+			/^network=\{/ { block = ""; next }
+			/^\}/ { if (index(block, ssid)) print (index(block, "disabled=1") ? "off" : "on"); next }
+			{ block = block $0 "\n" }' "$WIFI_CONF")
+		[ "$_now" = "$1" ] && return 0
+		sleep 1
+		_i=$((_i + 1))
+	done
+	got "Connect automatically is '$_now' in $WIFI_CONF, not $1"
+}
+
+still_joined() {
+	[ "$(wpa_state)" = COMPLETED ] || got "wpa_state is '$(wpa_state)'"
+}
+
+# After Disconnect: wpa_supplicant leaves the network within 10 s and doesn't
+# join it again for 20 s.
+left() {
+	_t0=$(date +%s)
+	_i=0
+	while [ "$(wpa_state)" = COMPLETED ] && [ $_i -lt 10 ]; do
+		sleep 1
+		_i=$((_i + 1))
+	done
+	_i=0
+	while [ $_i -lt 20 ]; do
+		_state=$(wpa_state)
+		case $_state in
+		DISCONNECTED | INACTIVE | SCANNING) ;;
+		*)
+			got "wpa_state was '$_state', not left, $(($(date +%s) - _t0)) s after Disconnect"
+			return
+			;;
+		esac
+		sleep 1
+		_i=$((_i + 1))
+	done
+}
+
+# The helper's wifi off: wlan0 NOAUTO and gone.
+wifi_off() {
+	helper_runs wifi off || return
+	case " $(sysrc -n ifconfig_wlan0) " in
+	*" NOAUTO "*) ;;
+	*) got "after wifi off, ifconfig_wlan0 is '$(sysrc -n ifconfig_wlan0)'" || return ;;
+	esac
+	! ifconfig wlan0 >/dev/null 2>&1 || got "wlan0 is still there after wifi off"
+}
+
+# What the window shows 20 s after Wi-Fi went off, with wpa_supplicant's
+# process and socket.
+off_shown() {
+	sleep 20
+	echo "@@seen wifi off +20s: wpa_supplicant '$(pgrep -l wpa_supplicant | tr '\n' ' ')', sockets '$(ls "$WIFI_CTRL" 2>&1 | tr '\n' ' ')'"
+	shot wifi-off-20s
+}
+
+# The helper's wifi on: NOAUTO gone, and wlan0 joined again.
+wifi_on() {
+	helper_runs wifi on || return
+	case " $(sysrc -n ifconfig_wlan0) " in
+	*" NOAUTO "*) got "wifi on left NOAUTO in ifconfig_wlan0" || return ;;
+	esac
+	wifi_up
+}
+
+# wlan0 made and not started, as rc leaves a NOAUTO wlan at boot; then wifi_on.
+wifi_on_as_at_boot() {
+	ifconfig wlan0 create wlandev "$(adapter)" >/dev/null || got "couldn't create wlan0 on $(adapter)" || return
+	wifi_on
+}
+
+# A second start knocks and exits; the open window stays the only one.
+one_window() {
+	as_user 'timeout 10 hyprbsd-network' || got "a second start didn't exit at once" || return
+	[ "$(windows)" -eq 1 ] || got "after a second start sway has $(windows) windows"
+}
+
+# After the join, as $user, from the keyboard: the joined network's card
+# turns Connect automatically off, which keeps the network joined, then on;
+# its Disconnect leaves the network. Then the helper's wifi off and on, twice,
+# with the window open, and a second start of the window.
+window() {
+	window_start || return
+	shot joined
+	# The switch, Rescan, then the joined network's card: opened, then Connect automatically off.
+	keys Tab Tab Tab space
+	shot open
+	keys Tab space
+	check "the window's Connect automatically off reaches $WIFI_CONF" autoconnect off
+	check "and keeps the network joined" still_joined
+	shot autoconnect-off
+	# Escape closes the card, keeping the focus on it; opened again, Connect automatically on.
+	keys Escape space Tab space
+	check "the window's Connect automatically on reaches $WIFI_CONF" autoconnect on
+	shot autoconnect-on
+	# Disconnect, the card's next button.
+	keys Tab space
+	check "the window's Disconnect leaves the network" left
+	shot disconnected
+	check "Wi-Fi off: wlan0 NOAUTO and gone" wifi_off
+	off_shown
+	check "Wi-Fi on in the same session: wlan0 made again and joined" wifi_on
+	sleep 3
+	shot wifi-on
+	check "Wi-Fi off again" wifi_off
+	check "Wi-Fi on with wlan0 made but not started, as at boot: joined again" wifi_on_as_at_boot
+	check "a second start leaves one window" one_window
+	window_stop
+}
+
+save_private() {
+	[ "$(wpa_as_user save_config)" = OK ] && [ "$(stat -f %Su:%Lp "$WIFI_CONF")" = root:600 ] &&
+		[ -z "$(ls "$WIFI_CONF".* 2>/dev/null)" ] ||
+		got "after save_config: $(stat -f %Su:%Lp "$WIFI_CONF") $(ls "$WIFI_CONF".* 2>/dev/null)"
+}
+
+conf_head() {
+	[ "$(head -n 2 "$WIFI_CONF")" = "$(printf 'ctrl_interface=DIR=%s GROUP=wheel\nupdate_config=1' "$WIFI_CTRL")" ] ||
+		got "$WIFI_CONF starts '$(head -n 2 "$WIFI_CONF" | tr '\n' ' ')'"
+}
+
+# The wlan the helper set up, its socket and private file, and the network
+# joined again by itself.
+rejoined() {
+	_dev=$(adapter)
+	check "the adapter's wlans_ line is wlan0" sh -c "[ \"\$(sysrc -n wlans_$_dev)\" = wlan0 ]"
+	check "wlan0 with WPA and DHCP" sh -c '[ "$(sysrc -n ifconfig_wlan0)" = "WPA DHCP" ]'
+	check "wpa_supplicant's umask 077" sh -c '[ "$(sysrc -n wpa_supplicant_umask)" = 077 ]'
+	check "wpa_supplicant.conf gives wheel the socket and lets wpa_supplicant save" conf_head
+	check "wpa_supplicant.conf is root's, mode 0600" sh -c "[ \"\$(stat -f %Su:%Lp $WIFI_CONF)\" = root:600 ]"
+	check "wpa_supplicant keeps the networks a scan found for an hour" grep -qx 'bss_expiration_age=3600' "$WIFI_CONF"
+	check "wlan0 joins the network by itself and has an address" wifi_up
+	check "a working route through wlan0" wifi_route
+	check "$user's hyprbsd-network list shows the network joined" listed
+	check "$user reads wpa_supplicant's state through the socket" said 'wpa_state=' "$(wpa_as_user status 2>&1)"
+	check "$user's save_config keeps the file root's, mode 0600" save_private
+}
+
+boot=$(cat /var/db/hnet-test-boot)
+echo "@@wifi-$boot start"
+case $boot in
+2)
+	check "the lent card attached, the guest's one Wi-Fi adapter" adapter_attached ||
+		dmesg | grep -i -E 'firmware|wlan|wifi' | tail -n 20 | sed 's/^/@@seen /'
+	dmesg | grep -E "^$(adapter):" | head -n 3 | sed 's/^/@@seen attach: /'
+	check "hyprbsd-network's devd rule is the one make install rendered" rule_installed
+	check "before this start, nothing had set the card up" not_set_up_before
+	check "devd's rule set the card up: wlans_, wlan0, wpa_supplicant.conf" devd_set_up
+	fixture "vtnet0 vtnet1 wlan0"
+	check "hyprbsd-network's settings taken out, the wlan kept, as Wi-Fi set up by hand" strip_and_stick
+	;;
+3)
+	check "wlan0's wpa_supplicant was stopped before devd started" stuck_before_devd
+	check "with wpa_supplicant stopped, the start finished, devd's rule put the settings back and restarted nothing" \
+		devd_put_back
+	unstick
+	;;
+4)
+	check "after the next start, wpa_supplicant uses the settings devd's rule put back" settings_in_use
+	fixture "vtnet0 vtnet1 wlan0"
+	check "$user joins the network with hyprbsd-network join, with an address and a working route" join &&
+		{
+			window
+			check "$user's hyprbsd-network list shows the network joined" listed
+			check "status says Wired, then Wi-Fi, as does status --follow" status_follows
+			check "a wrong password fails in words and changes nothing" wrong_password
+		}
+	rm -f /root/hnet-wifi-psk
+	shots
+	;;
+5)
+	rejoined
+	;;
+*)
+	echo "@@check FAIL a stage for boot $boot"
+	failures=1
+	;;
+esac
+echo "@@wifi-$boot done status=$failures"
+echo $((boot + 1)) >/var/db/hnet-test-boot
